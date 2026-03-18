@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════
+# agent-chat — Comunicacao entre agentes OpenClaw
+# Uso: agent-chat <agente-destino> "<mensagem>"
+#      agent-chat maestro "avalie as modificacoes"
+#      agent-chat --session <id> maestro "continue de onde paramos"
+#      agent-chat --watch                    # abre janela de monitoramento
+#      agent-chat --history [agente]         # mostra historico
+#      agent-chat --list                     # lista conversas ativas
+# ═══════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+CHAT_DIR="$HOME/.openclaw/agent-chats"
+LOG_DIR="$CHAT_DIR/logs"
+SELF="terminal"
+
+# Cores
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+C_DIM="\033[2m"
+C_CYAN="\033[36m"
+C_GREEN="\033[32m"
+C_YELLOW="\033[33m"
+C_MAGENTA="\033[35m"
+C_BLUE="\033[34m"
+C_RED="\033[31m"
+C_BG_DARK="\033[48;5;236m"
+C_WHITE="\033[97m"
+
+SEPARATOR="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# ─── Enforcement Gate ─────────────────────────────────────────
+ENFORCEMENT_CONFIG="$HOME/.openclaw/hooks/enforcement-gate/config.json"
+ENFORCEMENT_LOG="$HOME/.openclaw/logs/enforcement.log"
+RETRIES_FILE="$HOME/.openclaw/workspace-maestro/.orchestration/retries.json"
+
+enforcement_check() {
+    local agent="$1"
+    local response="$2"
+    local task_id="${3:-$agent-$(date +%s)}"
+
+    # Load config
+    if [[ ! -f "$ENFORCEMENT_CONFIG" ]]; then return 0; fi
+    local mode critical_agents critical_keywords evidence_sections max_retries
+    mode=$(jq -r '.mode // "shadow"' "$ENFORCEMENT_CONFIG" 2>/dev/null)
+    max_retries=$(jq -r '.max_retries // 3' "$ENFORCEMENT_CONFIG" 2>/dev/null)
+
+    # Check if agent is critical
+    local is_critical=false
+    if jq -e --arg a "$agent" '.critical_agents | index($a)' "$ENFORCEMENT_CONFIG" >/dev/null 2>&1; then
+        is_critical=true
+    fi
+
+    # Check if agent is excluded from keyword check (e.g. orchestrator)
+    local skip_keywords=false
+    if jq -e --arg a "$agent" '.excluded_agents_from_keyword_check // [] | index($a)' "$ENFORCEMENT_CONFIG" >/dev/null 2>&1; then
+        skip_keywords=true
+    fi
+
+    # Check keywords in response (skip for excluded agents)
+    if [[ "$is_critical" == "false" && "$skip_keywords" == "false" ]]; then
+        local lower_response
+        lower_response=$(echo "$response" | tr '[:upper:]' '[:lower:]')
+        while IFS= read -r kw; do
+            if [[ "$lower_response" == *"$kw"* ]]; then
+                is_critical=true
+                break
+            fi
+        done < <(jq -r '.critical_keywords[]' "$ENFORCEMENT_CONFIG" 2>/dev/null)
+    fi
+
+    # Log entry
+    local log_entry
+    log_entry=$(jq -n \
+        --arg ts "$(date -Iseconds)" \
+        --arg agent "$agent" \
+        --arg task "$task_id" \
+        --arg critical "$is_critical" \
+        --arg mode "$mode" \
+        '{ts:$ts, agent:$agent, task_id:$task, critical:($critical=="true"), mode:$mode}')
+
+    if [[ "$is_critical" == "false" ]]; then
+        log_entry=$(echo "$log_entry" | jq '. + {decision:"accept", reason_code:"NOT_CRITICAL"}')
+        mkdir -p "$(dirname "$ENFORCEMENT_LOG")"
+        echo "$log_entry" >> "$ENFORCEMENT_LOG"
+        return 0
+    fi
+
+    # Evidence check for critical messages
+    local evidence_count=0
+    local lower_response
+    lower_response=$(echo "$response" | tr '[:upper:]' '[:lower:]')
+    while IFS= read -r section; do
+        if [[ "$lower_response" == *"$section"* ]]; then
+            ((evidence_count++)) || true
+        fi
+    done < <(jq -r '.evidence_required_sections[]' "$ENFORCEMENT_CONFIG" 2>/dev/null)
+
+    if (( evidence_count >= 2 )); then
+        # Evidence OK
+        log_entry=$(echo "$log_entry" | jq --arg ev "$evidence_count" '. + {decision:"accept", reason_code:"OK", evidence_markers:($ev|tonumber)}')
+        echo "$log_entry" >> "$ENFORCEMENT_LOG"
+
+        # Update retries if exists
+        if [[ -f "$RETRIES_FILE" ]]; then
+            local tmp_retries="${RETRIES_FILE}.tmp"
+            jq --arg tid "$task_id" --arg now "$(date -Iseconds)" \
+                'if .tasks[$tid] then .tasks[$tid].status = "approved" | .tasks[$tid].lastError = "" else . end | .updatedAt = $now' \
+                "$RETRIES_FILE" > "$tmp_retries" 2>/dev/null && mv "$tmp_retries" "$RETRIES_FILE"
+        fi
+        return 0
+    fi
+
+    # Evidence missing — handle retries
+    local attempt=1
+    if [[ -f "$RETRIES_FILE" ]]; then
+        local current_attempts
+        current_attempts=$(jq -r --arg tid "$task_id" '.tasks[$tid].attempts // 0' "$RETRIES_FILE" 2>/dev/null)
+        attempt=$((current_attempts + 1))
+
+        local tmp_retries="${RETRIES_FILE}.tmp"
+        if (( attempt > max_retries )); then
+            # ESCALATE
+            jq --arg tid "$task_id" --arg now "$(date -Iseconds)" --arg owner "$agent" \
+                '.tasks[$tid] = {attempts:($tid | . as $t | input | .tasks[$t].attempts + 1), status:"escalated", critical:true, owner:$owner, lastError:"ESCALATE_TO_HUMAN: max retries exceeded"} | .updatedAt = $now' \
+                "$RETRIES_FILE" > "$tmp_retries" 2>/dev/null && mv "$tmp_retries" "$RETRIES_FILE" || {
+                    jq --arg tid "$task_id" --arg now "$(date -Iseconds)" --arg owner "$agent" --argjson att "$attempt" \
+                        '.tasks[$tid] = {attempts:$att, status:"escalated", critical:true, owner:$owner, lastError:"ESCALATE_TO_HUMAN: max retries exceeded"} | .updatedAt = $now' \
+                        "$RETRIES_FILE" > "$tmp_retries" && mv "$tmp_retries" "$RETRIES_FILE"
+                }
+
+            log_entry=$(echo "$log_entry" | jq --argjson att "$attempt" '. + {decision:"escalate", reason_code:"RETRY_LIMIT_EXCEEDED", attempt:$att}')
+            echo "$log_entry" >> "$ENFORCEMENT_LOG"
+
+            if [[ "$mode" == "enforce" ]]; then
+                echo -e "\n  ${C_RED}${C_BOLD}🛡️ ENFORCEMENT GATE: ESCALADO${C_RESET}"
+                echo -e "  ${C_RED}Tarefa ${task_id}: ${attempt} tentativas sem evidencias.${C_RESET}"
+                echo -e "  ${C_RED}Acao necessaria: revisao manual pelo Ben ou Maestro.${C_RESET}\n"
+            else
+                echo -e "\n  ${C_YELLOW}${C_DIM}🛡️ [shadow] Tarefa ${task_id} seria ESCALADA (${attempt} tentativas sem evidencias)${C_RESET}"
+            fi
+            return 1
+        else
+            # RETRY
+            jq --arg tid "$task_id" --arg now "$(date -Iseconds)" --arg owner "$agent" --argjson att "$attempt" \
+                '.tasks[$tid] = {attempts:$att, status:"failed", critical:true, owner:$owner, lastError:"Evidence Gate incompleto"} | .updatedAt = $now' \
+                "$RETRIES_FILE" > "$tmp_retries" 2>/dev/null && mv "$tmp_retries" "$RETRIES_FILE"
+
+            log_entry=$(echo "$log_entry" | jq --argjson att "$attempt" --argjson max "$max_retries" '. + {decision:"retry", reason_code:"EVIDENCE_MISSING", attempt:$att, max_retries:$max}')
+            echo "$log_entry" >> "$ENFORCEMENT_LOG"
+
+            if [[ "$mode" == "enforce" ]]; then
+                echo -e "\n  ${C_YELLOW}${C_BOLD}🛡️ ENFORCEMENT GATE: EVIDENCIA INSUFICIENTE${C_RESET}"
+                echo -e "  ${C_YELLOW}Tentativa ${attempt}/${max_retries}. Faltam evidencias obrigatorias.${C_RESET}\n"
+            else
+                echo -e "\n  ${C_DIM}🛡️ [shadow] Evidencia insuficiente (${attempt}/${max_retries}) — registrado${C_RESET}"
+            fi
+            return 0
+        fi
+    fi
+
+    log_entry=$(echo "$log_entry" | jq '. + {decision:"retry", reason_code:"EVIDENCE_MISSING", attempt:1}')
+    mkdir -p "$(dirname "$ENFORCEMENT_LOG")"
+    echo "$log_entry" >> "$ENFORCEMENT_LOG"
+    return 0
+}
+
+usage() {
+    echo -e "${C_BOLD}${C_CYAN}agent-chat${C_RESET} — Comunicacao entre agentes OpenClaw"
+    echo ""
+    echo -e "  ${C_BOLD}Uso:${C_RESET}"
+    echo -e "    agent-chat <agente> \"<mensagem>\"        Envia mensagem e mostra resposta"
+    echo -e "    agent-chat --watch                       Abre janela de monitoramento"
+    echo -e "    agent-chat --history [agente]             Mostra historico de conversas"
+    echo -e "    agent-chat --list                         Lista conversas ativas"
+    echo -e "    agent-chat --session <id> <agente> \"msg\" Continua sessao existente"
+    echo ""
+    echo -e "  ${C_BOLD}Agentes disponiveis:${C_RESET}"
+    echo -e "    maestro, sysdev, coder, clawdev, designer, flow, ops, briefer,"
+    echo -e "    finance, analyst, ads, sales, copywriter, creator, social-media,"
+    echo -e "    video-studio, sentinel, scout, hr, advisor, juris, concierge,"
+    echo -e "    travel, deals, stylist, cio, terminal"
+    echo ""
+    exit 0
+}
+
+get_log_file() {
+    local target="$1"
+    local today
+    today=$(date +%Y-%m-%d)
+    echo "$LOG_DIR/${today}-${SELF}-${target}.md"
+}
+
+init_log() {
+    local target="$1"
+    local log_file
+    log_file=$(get_log_file "$target")
+
+    if [[ ! -f "$log_file" ]]; then
+        cat > "$log_file" << EOF
+# Chat: ${SELF} ↔ ${target}
+**Data:** $(date +%Y-%m-%d) | **Iniciado:** $(date +%H:%M:%S)
+
+$SEPARATOR
+EOF
+    fi
+    echo "$log_file"
+}
+
+log_message() {
+    local log_file="$1"
+    local sender="$2"
+    local message="$3"
+    local timestamp
+    timestamp=$(date +%H:%M:%S)
+
+    cat >> "$log_file" << EOF
+
+### [$timestamp] $sender
+$message
+
+EOF
+}
+
+format_sent() {
+    local target="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date +%H:%M:%S)
+
+    echo -e ""
+    echo -e "${C_DIM}${SEPARATOR}${C_RESET}"
+    echo -e "${C_BOLD}${C_GREEN}  ▶ ${SELF}${C_RESET} ${C_DIM}→ ${target} ${C_RESET}${C_DIM}[${timestamp}]${C_RESET}"
+    echo -e "${C_DIM}  ─────────────────────────────────────────${C_RESET}"
+    echo -e "  ${message}"
+    echo -e "${C_DIM}${SEPARATOR}${C_RESET}"
+}
+
+format_received() {
+    local sender="$1"
+    local message="$2"
+    local duration="$3"
+    local timestamp
+    timestamp=$(date +%H:%M:%S)
+
+    echo -e ""
+    echo -e "${C_DIM}${SEPARATOR}${C_RESET}"
+    echo -e "${C_BOLD}${C_MAGENTA}  ◀ ${sender}${C_RESET} ${C_DIM}→ ${SELF} ${C_RESET}${C_DIM}[${timestamp}] (${duration})${C_RESET}"
+    echo -e "${C_DIM}  ─────────────────────────────────────────${C_RESET}"
+    # Wrap long lines and indent
+    echo "$message" | fold -s -w 76 | sed 's/^/  /'
+    echo -e "${C_DIM}${SEPARATOR}${C_RESET}"
+    echo ""
+}
+
+format_error() {
+    local message="$1"
+    echo -e "${C_RED}  ✗ Erro: ${message}${C_RESET}" >&2
+}
+
+send_message() {
+    local target="$1"
+    local message="$2"
+    local session_flag=""
+
+    if [[ -n "${SESSION_ID:-}" ]]; then
+        session_flag="--session-id $SESSION_ID"
+    fi
+
+    local log_file
+    log_file=$(init_log "$target")
+
+    # Mostra mensagem enviada
+    format_sent "$target" "$message"
+
+    # Log
+    log_message "$log_file" "$SELF" "$message"
+
+    # Spinner enquanto aguarda
+    echo -ne "  ${C_DIM}⏳ Aguardando resposta de ${target}...${C_RESET}"
+
+    local start_time
+    start_time=$(date +%s%N)
+
+    # Envia via openclaw agent
+    local result
+    result=$(openclaw agent --agent "$target" --message "$message" $session_flag --json 2>&1) || {
+        echo -e "\r                                                    "
+        format_error "Falha ao contactar ${target}"
+        echo "$result" | head -5 | sed 's/^/    /' >&2
+        log_message "$log_file" "SYSTEM" "ERRO: Falha ao contactar ${target}"
+        return 1
+    }
+
+    local end_time
+    end_time=$(date +%s%N)
+    local duration_ms=$(( (end_time - start_time) / 1000000 ))
+    local duration_str
+    if (( duration_ms > 1000 )); then
+        duration_str="$(( duration_ms / 1000 )).$(( (duration_ms % 1000) / 100 ))s"
+    else
+        duration_str="${duration_ms}ms"
+    fi
+
+    # Limpa spinner
+    echo -e "\r                                                    \r"
+
+    # Extrai resposta
+    local response
+    response=$(echo "$result" | jq -r '.result.payloads[0].text // "Sem resposta"' 2>/dev/null) || {
+        response="[Resposta raw] $(echo "$result" | head -20)"
+    }
+
+    # Extrai session ID para continuidade
+    local new_session_id
+    new_session_id=$(echo "$result" | jq -r '.result.meta.agentMeta.sessionId // empty' 2>/dev/null) || true
+
+    # Mostra resposta
+    format_received "$target" "$response" "$duration_str"
+
+    # Enforcement Gate
+    enforcement_check "$target" "$response" "${SESSION_ID:-$target-$(date +%s)}" || true
+
+    # Log
+    log_message "$log_file" "$target" "$response"
+
+    # Mostra session ID para continuidade
+    if [[ -n "$new_session_id" ]]; then
+        echo -e "  ${C_DIM}📌 Session: ${new_session_id}${C_RESET}"
+        echo -e "  ${C_DIM}   Para continuar: agent-chat --session ${new_session_id} ${target} \"msg\"${C_RESET}"
+    fi
+}
+
+watch_logs() {
+    local watch_file="${1:-}"
+
+    if [[ -z "$watch_file" ]]; then
+        # Monitora todos os logs de hoje
+        watch_file="$LOG_DIR/$(date +%Y-%m-%d)-*.md"
+    fi
+
+    # Abre gnome-terminal com monitoramento
+    local watch_script="$CHAT_DIR/.watch-chat.sh"
+    cat > "$watch_script" << 'WATCHEOF'
+#!/usr/bin/env bash
+LOG_DIR="$HOME/.openclaw/agent-chats/logs"
+TODAY=$(date +%Y-%m-%d)
+
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+C_CYAN="\033[36m"
+C_DIM="\033[2m"
+C_YELLOW="\033[33m"
+
+clear
+echo -e "${C_BOLD}${C_CYAN}"
+echo "  ╔══════════════════════════════════════════════════════╗"
+echo "  ║        🦞 OpenClaw — Agent Chat Monitor             ║"
+echo "  ║        $(date +%Y-%m-%d' '%H:%M:%S)                            ║"
+echo "  ╚══════════════════════════════════════════════════════╝"
+echo -e "${C_RESET}"
+echo -e "  ${C_DIM}Monitorando: ${LOG_DIR}/${TODAY}-*.md${C_RESET}"
+echo -e "  ${C_DIM}Ctrl+C para sair${C_RESET}"
+echo ""
+
+# Mostra conteudo existente
+for f in "$LOG_DIR"/${TODAY}-*.md; do
+    [[ -f "$f" ]] && cat "$f" && echo ""
+done
+
+# Monitora novos conteudos
+inotifywait -m -q -e modify,create "$LOG_DIR" 2>/dev/null | while read -r dir event file; do
+    if [[ "$file" == ${TODAY}-*.md ]]; then
+        clear
+        echo -e "${C_BOLD}${C_CYAN}"
+        echo "  ╔══════════════════════════════════════════════════════╗"
+        echo "  ║        🦞 OpenClaw — Agent Chat Monitor             ║"
+        echo "  ║        $(date +%Y-%m-%d' '%H:%M:%S)     [atualizado]         ║"
+        echo "  ╚══════════════════════════════════════════════════════╝"
+        echo -e "${C_RESET}"
+        echo ""
+        for f in "$LOG_DIR"/${TODAY}-*.md; do
+            [[ -f "$f" ]] && cat "$f" && echo ""
+        done
+    fi
+done
+WATCHEOF
+    chmod +x "$watch_script"
+
+    # Verifica se inotifywait esta disponivel
+    if ! command -v inotifywait &>/dev/null; then
+        echo -e "${C_YELLOW}  ⚠ inotifywait nao encontrado. Instalando inotify-tools...${C_RESET}"
+        sudo apt-get install -y inotify-tools 2>/dev/null || {
+            # Fallback: usa polling com watch
+            cat > "$watch_script" << 'WATCHEOF2'
+#!/usr/bin/env bash
+LOG_DIR="$HOME/.openclaw/agent-chats/logs"
+TODAY=$(date +%Y-%m-%d)
+while true; do
+    clear
+    echo -e "\033[1m\033[36m"
+    echo "  ╔══════════════════════════════════════════════════════╗"
+    echo "  ║        🦞 OpenClaw — Agent Chat Monitor             ║"
+    echo "  ║        $(date +%Y-%m-%d' '%H:%M:%S)                            ║"
+    echo "  ╚══════════════════════════════════════════════════════╝"
+    echo -e "\033[0m"
+    echo ""
+    for f in "$LOG_DIR"/${TODAY}-*.md; do
+        [[ -f "$f" ]] && cat "$f" && echo ""
+    done
+    sleep 2
+done
+WATCHEOF2
+            chmod +x "$watch_script"
+        }
+    fi
+
+    # Abre janela
+    gnome-terminal --title="🦞 OpenClaw Agent Chat" \
+        --geometry=90x40 \
+        -- bash "$watch_script" &
+
+    echo -e "${C_GREEN}  ✓ Janela de monitoramento aberta${C_RESET}"
+}
+
+show_history() {
+    local filter="${1:-}"
+    local today
+    today=$(date +%Y-%m-%d)
+
+    echo -e "${C_BOLD}${C_CYAN}  Historico de conversas${C_RESET}"
+    echo -e "${C_DIM}${SEPARATOR}${C_RESET}"
+
+    if [[ -n "$filter" ]]; then
+        local files=("$LOG_DIR"/*-"${SELF}-${filter}".md "$LOG_DIR"/*-"${filter}-${SELF}".md)
+    else
+        local files=("$LOG_DIR"/*.md)
+    fi
+
+    local found=0
+    for f in "${files[@]}"; do
+        if [[ -f "$f" ]]; then
+            found=1
+            local basename
+            basename=$(basename "$f")
+            echo -e "\n  ${C_BOLD}${C_BLUE}📄 ${basename}${C_RESET}"
+            echo -e "${C_DIM}  ─────────────────────────────────────────${C_RESET}"
+            cat "$f" | sed 's/^/  /'
+            echo ""
+        fi
+    done
+
+    if (( found == 0 )); then
+        echo -e "  ${C_DIM}Nenhuma conversa encontrada.${C_RESET}"
+    fi
+}
+
+list_sessions() {
+    local today
+    today=$(date +%Y-%m-%d)
+
+    echo -e "${C_BOLD}${C_CYAN}  Conversas de hoje (${today})${C_RESET}"
+    echo -e "${C_DIM}${SEPARATOR}${C_RESET}"
+
+    local found=0
+    for f in "$LOG_DIR"/${today}-*.md; do
+        if [[ -f "$f" ]]; then
+            found=1
+            local basename
+            basename=$(basename "$f" .md)
+            local parts
+            IFS='-' read -ra parts <<< "$basename"
+            # Format: YYYY-MM-DD-from-to
+            local agents="${parts[3]}-${parts[4]}"
+            local lines
+            lines=$(grep -c "^###" "$f" 2>/dev/null || echo 0)
+            local size
+            size=$(wc -c < "$f" | tr -d ' ')
+            echo -e "  ${C_GREEN}●${C_RESET} ${C_BOLD}${agents}${C_RESET} — ${lines} mensagens (${size} bytes)"
+        fi
+    done
+
+    if (( found == 0 )); then
+        echo -e "  ${C_DIM}Nenhuma conversa hoje.${C_RESET}"
+    fi
+}
+
+# ─── Parse args ───────────────────────────────────────────────
+
+SESSION_ID=""
+
+case "${1:-}" in
+    -h|--help|"")
+        usage
+        ;;
+    --watch)
+        watch_logs "${2:-}"
+        exit 0
+        ;;
+    --history)
+        show_history "${2:-}"
+        exit 0
+        ;;
+    --list)
+        list_sessions
+        exit 0
+        ;;
+    --session)
+        SESSION_ID="$2"
+        shift 2
+        ;;
+esac
+
+TARGET="${1:-}"
+MESSAGE="${2:-}"
+
+if [[ -z "$TARGET" || -z "$MESSAGE" ]]; then
+    echo -e "${C_RED}  ✗ Uso: agent-chat <agente> \"<mensagem>\"${C_RESET}" >&2
+    exit 1
+fi
+
+send_message "$TARGET" "$MESSAGE"

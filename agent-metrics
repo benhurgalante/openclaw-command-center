@@ -1,0 +1,668 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════
+# agent-metrics — Dashboard de metricas do ecossistema OpenClaw
+# Uso: agent-metrics              (dashboard de hoje)
+#      agent-metrics --week       (ultimos 7 dias)
+#      agent-metrics --agent <n>  (filtrar por agente)
+#      agent-metrics --export     (exportar CSV)
+# ═══════════════════════════════════════════════════════════════
+
+set -euo pipefail
+export LC_NUMERIC=C
+
+# ─── Config ───────────────────────────────────────────────────
+CHAT_DIR="$HOME/.openclaw/agent-chats"
+LOG_DIR="$CHAT_DIR/logs"
+AGENTS_DIR="$HOME/.openclaw/agents"
+OPENCLAW_CONFIG="$HOME/.openclaw/openclaw.json"
+
+# ─── Cores ────────────────────────────────────────────────────
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+C_DIM="\033[2m"
+C_CYAN="\033[36m"
+C_GREEN="\033[32m"
+C_YELLOW="\033[33m"
+C_MAGENTA="\033[35m"
+C_BLUE="\033[34m"
+C_RED="\033[31m"
+C_WHITE="\033[97m"
+C_BG_DARK="\033[48;5;236m"
+C_BG_HEADER="\033[48;5;24m"
+
+SEPARATOR="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+THIN_SEP="──────────────────────────────────────────────────────────────────────────────"
+
+# ─── Args ─────────────────────────────────────────────────────
+MODE="today"
+FILTER_AGENT=""
+EXPORT_CSV=false
+DAYS=1
+
+usage() {
+    echo -e "${C_BOLD}${C_CYAN}agent-metrics${C_RESET} — Dashboard de metricas OpenClaw"
+    echo ""
+    echo -e "  ${C_BOLD}Uso:${C_RESET}"
+    echo -e "    agent-metrics                   Dashboard de hoje"
+    echo -e "    agent-metrics --week             Ultimos 7 dias"
+    echo -e "    agent-metrics --agent <nome>     Filtrar por agente"
+    echo -e "    agent-metrics --export           Exportar para CSV"
+    echo -e "    agent-metrics --help             Mostra esta ajuda"
+    echo ""
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage ;;
+        --week) MODE="week"; DAYS=7; shift ;;
+        --agent)
+            FILTER_AGENT="$2"
+            shift 2
+            ;;
+        --export) EXPORT_CSV=true; shift ;;
+        *) echo -e "${C_RED}  Opcao desconhecida: $1${C_RESET}" >&2; exit 1 ;;
+    esac
+done
+
+# ─── Funcoes utilitarias ──────────────────────────────────────
+
+# Gera lista de datas no range (YYYY-MM-DD)
+get_date_range() {
+    local days="$1"
+    local dates=()
+    for (( i=0; i<days; i++ )); do
+        dates+=("$(date -d "-${i} days" +%Y-%m-%d)")
+    done
+    echo "${dates[@]}"
+}
+
+# Pega lista de agentes configurados no openclaw.json
+get_configured_agents() {
+    if [[ -f "$OPENCLAW_CONFIG" ]]; then
+        # JSON5 may have comments; strip them and extract agent IDs from agents.list[]
+        sed 's|//.*||' "$OPENCLAW_CONFIG" | \
+        python3 -c "
+import sys, json, re
+raw = sys.stdin.read()
+# Remove trailing commas before } or ]
+raw = re.sub(r',\s*([}\]])', r'\1', raw)
+try:
+    data = json.loads(raw)
+    agent_list = data.get('agents', {}).get('list', [])
+    for a in sorted(agent_list, key=lambda x: x.get('id', '')):
+        aid = a.get('id', '')
+        if aid:
+            print(aid)
+except:
+    pass
+" 2>/dev/null
+    fi
+}
+
+# Conta mensagens por agente nos logs de chat
+count_messages_from_logs() {
+    local dates=("$@")
+    # Output: agent count
+    for d in "${dates[@]}"; do
+        for logfile in "$LOG_DIR"/${d}-*.md; do
+            [[ -f "$logfile" ]] || continue
+            local basename
+            basename=$(basename "$logfile" .md)
+            # Format: YYYY-MM-DD-from-to
+            local agents_part="${basename#${d}-}"
+            local from_agent="${agents_part%%-*}"
+            local to_agent="${agents_part#*-}"
+
+            # Count ### headers per agent in the file
+            local from_count to_count
+            from_count=$(grep -c "^### \[.*\] ${from_agent}$" "$logfile" 2>/dev/null || echo 0)
+            to_count=$(grep -c "^### \[.*\] ${to_agent}$" "$logfile" 2>/dev/null || echo 0)
+
+            [[ $from_count -gt 0 ]] && echo "${from_agent} ${from_count}"
+            [[ $to_count -gt 0 ]] && echo "${to_agent} ${to_count}"
+        done
+    done
+}
+
+# Extrai metricas de latencia e tokens das sessoes JSONL
+# Output per line: agentId inputTokens outputTokens totalTokens cost durationMs
+extract_session_metrics() {
+    local dates=("$@")
+    local date_start date_end
+
+    # Calculate date boundaries
+    date_start="${dates[${#dates[@]}-1]}T00:00:00Z"
+    date_end="${dates[0]}T23:59:59Z"
+
+    for agent_dir in "$AGENTS_DIR"/*/; do
+        local agent_id
+        agent_id=$(basename "$agent_dir")
+
+        # Filter if needed
+        [[ -n "$FILTER_AGENT" && "$agent_id" != "$FILTER_AGENT" ]] && continue
+
+        local sessions_dir="${agent_dir}sessions"
+        [[ -d "$sessions_dir" ]] || continue
+
+        for jsonl_file in "$sessions_dir"/*.jsonl; do
+            [[ -f "$jsonl_file" ]] || continue
+
+            # Extract usage data from assistant messages within date range
+            python3 -c "
+import json, sys
+
+agent = '$agent_id'
+date_start = '$date_start'
+date_end = '$date_end'
+
+try:
+    with open('$jsonl_file', 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except:
+                continue
+
+            ts = obj.get('timestamp', '')
+            if not ts:
+                continue
+
+            # Filter by date range
+            if ts < date_start or ts > date_end:
+                continue
+
+            # Extract from message entries with usage
+            if obj.get('type') == 'message':
+                msg = obj.get('message', {})
+                usage = msg.get('usage', {})
+                if usage and msg.get('role') == 'assistant':
+                    inp = usage.get('input', 0)
+                    out = usage.get('output', 0)
+                    total = usage.get('totalTokens', inp + out)
+                    cost_data = usage.get('cost', {})
+                    cost = cost_data.get('total', 0) if isinstance(cost_data, dict) else 0
+                    print(f'{agent}\t{inp}\t{out}\t{total}\t{cost:.6f}')
+except Exception as e:
+    pass
+" 2>/dev/null
+        done
+    done
+}
+
+# Extrai duracao (durationMs) dos logs de chat
+# Parseia os formatos de duracao na saida formatada: (Xs) ou (Xms)
+extract_latencies_from_logs() {
+    local dates=("$@")
+    for d in "${dates[@]}"; do
+        for logfile in "$LOG_DIR"/${d}-*.md; do
+            [[ -f "$logfile" ]] || continue
+            local basename
+            basename=$(basename "$logfile" .md)
+            local agents_part="${basename#${d}-}"
+            local to_agent="${agents_part#*-}"
+
+            # Look for duration patterns in the log (from agent-chat format_received)
+            # The log itself doesn't store duration, but we can estimate from timestamps
+            # Parse consecutive message timestamps to estimate response time
+            python3 -c "
+import re, sys
+
+agent = '$to_agent'
+prev_ts = None
+prev_sender = None
+
+with open('$logfile', 'r') as f:
+    for line in f:
+        m = re.match(r'^### \[(\d{2}):(\d{2}):(\d{2})\] (\S+)', line)
+        if m:
+            h, mi, s, sender = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
+            ts = h * 3600 + mi * 60 + s
+            # If previous was a request and this is the response
+            if prev_ts is not None and prev_sender != sender and sender == agent:
+                duration_ms = (ts - prev_ts) * 1000
+                if 0 < duration_ms < 300000:  # sanity: < 5 min
+                    print(f'{agent}\t{duration_ms}')
+            prev_ts = ts
+            prev_sender = sender
+" 2>/dev/null
+        done
+    done
+}
+
+# Conta sessoes ativas (arquivos JSONL com updatedAt recente)
+count_active_sessions() {
+    local cutoff_epoch
+    cutoff_epoch=$(date -d "-24 hours" +%s)
+    cutoff_ms=$((cutoff_epoch * 1000))
+
+    for agent_dir in "$AGENTS_DIR"/*/; do
+        local agent_id
+        agent_id=$(basename "$agent_dir")
+        [[ -n "$FILTER_AGENT" && "$agent_id" != "$FILTER_AGENT" ]] && continue
+
+        local sessions_file="${agent_dir}sessions/sessions.json"
+        [[ -f "$sessions_file" ]] || continue
+
+        python3 -c "
+import json
+agent = '$agent_id'
+cutoff = $cutoff_ms
+try:
+    with open('$sessions_file', 'r') as f:
+        data = json.load(f)
+    count = 0
+    for key, sess in data.items():
+        updated = sess.get('updatedAt', 0)
+        if updated >= cutoff:
+            count += 1
+    if count > 0:
+        print(f'{agent}\t{count}')
+except:
+    pass
+" 2>/dev/null
+    done
+}
+
+# ─── Calculo de percentis ─────────────────────────────────────
+calc_percentiles() {
+    # Reads lines of "agent\tvalue", outputs "agent\tp50\tp95"
+    python3 -c "
+import sys
+from collections import defaultdict
+
+data = defaultdict(list)
+for line in sys.stdin:
+    parts = line.strip().split('\t')
+    if len(parts) >= 2:
+        agent = parts[0]
+        try:
+            val = float(parts[1])
+            data[agent].append(val)
+        except:
+            pass
+
+for agent in sorted(data.keys()):
+    vals = sorted(data[agent])
+    n = len(vals)
+    if n == 0:
+        continue
+    p50_idx = max(0, int(n * 0.5) - 1)
+    p95_idx = max(0, int(n * 0.95) - 1)
+    p50 = vals[p50_idx]
+    p95 = vals[p95_idx]
+    print(f'{agent}\t{p50:.0f}\t{p95:.0f}\t{n}')
+" 2>/dev/null
+}
+
+# ─── Agregacao de tokens ──────────────────────────────────────
+aggregate_tokens() {
+    # Reads lines of "agent\tinput\toutput\ttotal\tcost", aggregates
+    python3 -c "
+import sys
+from collections import defaultdict
+
+totals = defaultdict(lambda: {'input': 0, 'output': 0, 'total': 0, 'cost': 0.0, 'calls': 0})
+for line in sys.stdin:
+    parts = line.strip().split('\t')
+    if len(parts) >= 5:
+        agent = parts[0]
+        totals[agent]['input'] += int(parts[1])
+        totals[agent]['output'] += int(parts[2])
+        totals[agent]['total'] += int(parts[3])
+        totals[agent]['cost'] += float(parts[4])
+        totals[agent]['calls'] += 1
+
+for agent in sorted(totals.keys()):
+    d = totals[agent]
+    print(f\"{agent}\t{d['input']}\t{d['output']}\t{d['total']}\t{d['cost']:.4f}\t{d['calls']}\")
+" 2>/dev/null
+}
+
+# ─── Agregacao de mensagens ───────────────────────────────────
+aggregate_messages() {
+    # Reads lines of "agent count", aggregates
+    python3 -c "
+import sys
+from collections import defaultdict
+
+totals = defaultdict(int)
+for line in sys.stdin:
+    parts = line.strip().split()
+    if len(parts) >= 2:
+        agent = parts[0]
+        try:
+            totals[agent] += int(parts[1])
+        except:
+            pass
+
+for agent in sorted(totals.keys()):
+    print(f'{agent}\t{totals[agent]}')
+" 2>/dev/null
+}
+
+# ─── Formatacao de numeros ────────────────────────────────────
+fmt_num() {
+    python3 -c "
+n = int('${1:-0}')
+if n >= 1000000:
+    print(f'{n/1000000:.1f}M')
+elif n >= 1000:
+    print(f'{n/1000:.1f}K')
+else:
+    print(n)
+"
+}
+
+fmt_ms() {
+    python3 -c "
+ms = int('${1:-0}')
+if ms >= 60000:
+    print(f'{ms/60000:.1f}m')
+elif ms >= 1000:
+    print(f'{ms/1000:.1f}s')
+else:
+    print(f'{ms}ms')
+"
+}
+
+# ─── Render do Dashboard ─────────────────────────────────────
+
+render_header() {
+    local period_label="$1"
+    echo ""
+    echo -e "${C_BG_HEADER}${C_WHITE}${C_BOLD}                                                                              ${C_RESET}"
+    echo -e "${C_BG_HEADER}${C_WHITE}${C_BOLD}   OPENCLAW AGENT METRICS DASHBOARD                                           ${C_RESET}"
+    echo -e "${C_BG_HEADER}${C_WHITE}   $(date '+%Y-%m-%d %H:%M:%S')  |  Periodo: ${period_label}                                    ${C_RESET}"
+    if [[ -n "$FILTER_AGENT" ]]; then
+        echo -e "${C_BG_HEADER}${C_YELLOW}   Filtro: ${FILTER_AGENT}                                                               ${C_RESET}"
+    fi
+    echo -e "${C_BG_HEADER}${C_WHITE}${C_BOLD}                                                                              ${C_RESET}"
+    echo ""
+}
+
+render_section() {
+    local title="$1"
+    echo -e "${C_BOLD}${C_CYAN}  $title${C_RESET}"
+    echo -e "${C_DIM}  ${THIN_SEP}${C_RESET}"
+}
+
+render_kpi_latency() {
+    local latency_data="$1"
+
+    render_section "1. LATENCIA POR AGENTE (p50 / p95)"
+
+    if [[ -z "$latency_data" ]]; then
+        echo -e "  ${C_DIM}  Sem dados de latencia no periodo.${C_RESET}"
+        echo ""
+        return
+    fi
+
+    printf "  ${C_BOLD}  %-18s %10s %10s %8s${C_RESET}\n" "AGENTE" "p50" "p95" "AMOSTRAS"
+    echo -e "  ${C_DIM}  ──────────────────────────────────────────────────${C_RESET}"
+
+    while IFS=$'\t' read -r agent p50 p95 count; do
+        [[ -z "$agent" ]] && continue
+        local p50_fmt p95_fmt
+        p50_fmt=$(fmt_ms "${p50%.*}")
+        p95_fmt=$(fmt_ms "${p95%.*}")
+
+        # Color code based on p95
+        local p95_int="${p95%%.*}"
+        local color="$C_GREEN"
+        if [[ "$p95_int" =~ ^[0-9]+$ ]] && (( p95_int > 30000 )); then
+            color="$C_RED"
+        elif [[ "$p95_int" =~ ^[0-9]+$ ]] && (( p95_int > 10000 )); then
+            color="$C_YELLOW"
+        fi
+
+        printf "  ${color}  %-18s %10s %10s %8s${C_RESET}\n" "$agent" "$p50_fmt" "$p95_fmt" "$count"
+    done <<< "$latency_data"
+    echo ""
+}
+
+render_kpi_tokens() {
+    local token_data="$1"
+
+    render_section "2. TOKENS CONSUMIDOS POR AGENTE"
+
+    if [[ -z "$token_data" ]]; then
+        echo -e "  ${C_DIM}  Sem dados de tokens no periodo.${C_RESET}"
+        echo ""
+        return
+    fi
+
+    printf "  ${C_BOLD}  %-18s %10s %10s %10s %10s %6s${C_RESET}\n" "AGENTE" "INPUT" "OUTPUT" "TOTAL" "CUSTO" "CALLS"
+    echo -e "  ${C_DIM}  ──────────────────────────────────────────────────────────────────${C_RESET}"
+
+    while IFS=$'\t' read -r agent inp out total cost calls; do
+        [[ -z "$agent" ]] && continue
+        local inp_fmt out_fmt total_fmt
+        inp_fmt=$(fmt_num "$inp")
+        out_fmt=$(fmt_num "$out")
+        total_fmt=$(fmt_num "$total")
+
+        printf "  ${C_WHITE}  %-18s %10s %10s %10s %9s$ %6s${C_RESET}\n" \
+            "$agent" "$inp_fmt" "$out_fmt" "$total_fmt" "$cost" "$calls"
+    done <<< "$token_data"
+    echo ""
+}
+
+render_kpi_messages() {
+    local msg_data="$1"
+
+    render_section "3. MENSAGENS TROCADAS"
+
+    if [[ -z "$msg_data" ]]; then
+        echo -e "  ${C_DIM}  Sem mensagens no periodo.${C_RESET}"
+        echo ""
+        return
+    fi
+
+    local total_msgs=0
+    printf "  ${C_BOLD}  %-18s %10s  %s${C_RESET}\n" "AGENTE" "MSGS" "BARRA"
+    echo -e "  ${C_DIM}  ──────────────────────────────────────────────────${C_RESET}"
+
+    # Find max for bar scaling
+    local max_msgs=1
+    while IFS=$'\t' read -r agent count; do
+        [[ -z "$agent" ]] && continue
+        (( count > max_msgs )) && max_msgs=$count
+    done <<< "$msg_data"
+
+    while IFS=$'\t' read -r agent count; do
+        [[ -z "$agent" ]] && continue
+        total_msgs=$((total_msgs + count))
+        local bar_len=$(( count * 30 / max_msgs ))
+        local bar=""
+        for (( b=0; b<bar_len; b++ )); do bar+="█"; done
+        printf "  ${C_GREEN}  %-18s %10s  ${C_CYAN}%s${C_RESET}\n" "$agent" "$count" "$bar"
+    done <<< "$msg_data"
+
+    echo -e "  ${C_DIM}  ──────────────────────────────────────────────────${C_RESET}"
+    echo -e "  ${C_BOLD}  Total: ${total_msgs} mensagens${C_RESET}"
+    echo ""
+}
+
+render_kpi_sessions() {
+    local session_data="$1"
+
+    render_section "4. SESSOES ATIVAS (ultimas 24h)"
+
+    if [[ -z "$session_data" ]]; then
+        echo -e "  ${C_DIM}  Nenhuma sessao ativa.${C_RESET}"
+        echo ""
+        return
+    fi
+
+    local total_sessions=0
+    printf "  ${C_BOLD}  %-18s %10s${C_RESET}\n" "AGENTE" "SESSOES"
+    echo -e "  ${C_DIM}  ──────────────────────────────────────────────────${C_RESET}"
+
+    while IFS=$'\t' read -r agent count; do
+        [[ -z "$agent" ]] && continue
+        total_sessions=$((total_sessions + count))
+        printf "  ${C_MAGENTA}  %-18s %10s${C_RESET}\n" "$agent" "$count"
+    done <<< "$session_data"
+
+    echo -e "  ${C_DIM}  ──────────────────────────────────────────────────${C_RESET}"
+    echo -e "  ${C_BOLD}  Total: ${total_sessions} sessoes ativas${C_RESET}"
+    echo ""
+}
+
+render_kpi_availability() {
+    local configured_agents="$1"
+
+    render_section "5. DISPONIBILIDADE DE AGENTES"
+
+    if [[ -z "$configured_agents" ]]; then
+        echo -e "  ${C_DIM}  Nenhum agente configurado encontrado.${C_RESET}"
+        echo ""
+        return
+    fi
+
+    local total=0
+    local with_sessions=0
+    local col=0
+    local line=""
+
+    while IFS= read -r agent; do
+        [[ -z "$agent" ]] && continue
+
+        # Filter if needed
+        if [[ -n "$FILTER_AGENT" && "$agent" != "$FILTER_AGENT" ]]; then
+            continue
+        fi
+
+        total=$((total + 1))
+
+        local status_icon status_color
+        local sessions_file="${AGENTS_DIR}/${agent}/sessions/sessions.json"
+        local agent_dir="${AGENTS_DIR}/${agent}"
+
+        if [[ -d "$agent_dir" ]]; then
+            if [[ -f "$sessions_file" ]]; then
+                status_icon="●"
+                status_color="$C_GREEN"
+                with_sessions=$((with_sessions + 1))
+            else
+                status_icon="○"
+                status_color="$C_YELLOW"
+            fi
+        else
+            status_icon="✗"
+            status_color="$C_RED"
+        fi
+
+        if (( col % 4 == 0 )); then
+            printf "    "
+        fi
+        printf "${status_color}%s %-14s${C_RESET}" "$status_icon" "$agent"
+        col=$((col + 1))
+        if (( col % 4 == 0 )); then
+            printf "\n"
+        fi
+    done <<< "$configured_agents"
+
+    echo ""
+    echo -e "  ${C_DIM}  ──────────────────────────────────────────────────${C_RESET}"
+    echo -e "  ${C_BOLD}  ${with_sessions}/${total} agentes com sessoes  ${C_GREEN}● ativo${C_RESET}  ${C_YELLOW}○ configurado${C_RESET}  ${C_RED}✗ ausente${C_RESET}"
+    echo ""
+}
+
+# ─── Exportar CSV ─────────────────────────────────────────────
+export_csv() {
+    local dates=("$@")
+    local csv_file="$CHAT_DIR/metrics-$(date +%Y%m%d-%H%M%S).csv"
+
+    echo "type,agent,metric,value" > "$csv_file"
+
+    # Latencies
+    local latencies
+    latencies=$(extract_latencies_from_logs "${dates[@]}" | calc_percentiles)
+    while IFS=$'\t' read -r agent p50 p95 count; do
+        [[ -z "$agent" ]] && continue
+        echo "latency,${agent},p50_ms,${p50}" >> "$csv_file"
+        echo "latency,${agent},p95_ms,${p95}" >> "$csv_file"
+        echo "latency,${agent},samples,${count}" >> "$csv_file"
+    done <<< "$latencies"
+
+    # Tokens
+    local tokens
+    tokens=$(extract_session_metrics "${dates[@]}" | aggregate_tokens)
+    while IFS=$'\t' read -r agent inp out total cost calls; do
+        [[ -z "$agent" ]] && continue
+        echo "tokens,${agent},input,${inp}" >> "$csv_file"
+        echo "tokens,${agent},output,${out}" >> "$csv_file"
+        echo "tokens,${agent},total,${total}" >> "$csv_file"
+        echo "tokens,${agent},cost_usd,${cost}" >> "$csv_file"
+        echo "tokens,${agent},api_calls,${calls}" >> "$csv_file"
+    done <<< "$tokens"
+
+    # Messages
+    local messages
+    messages=$(count_messages_from_logs "${dates[@]}" | aggregate_messages)
+    while IFS=$'\t' read -r agent count; do
+        [[ -z "$agent" ]] && continue
+        echo "messages,${agent},count,${count}" >> "$csv_file"
+    done <<< "$messages"
+
+    # Sessions
+    local sessions
+    sessions=$(count_active_sessions)
+    while IFS=$'\t' read -r agent count; do
+        [[ -z "$agent" ]] && continue
+        echo "sessions,${agent},active,${count}" >> "$csv_file"
+    done <<< "$sessions"
+
+    echo -e "${C_GREEN}  CSV exportado: ${csv_file}${C_RESET}"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
+
+main() {
+    local dates
+    read -ra dates <<< "$(get_date_range "$DAYS")"
+
+    local period_label
+    if [[ "$MODE" == "week" ]]; then
+        period_label="${dates[${#dates[@]}-1]} a ${dates[0]} (7 dias)"
+    else
+        period_label="${dates[0]} (hoje)"
+    fi
+
+    # Export mode
+    if $EXPORT_CSV; then
+        export_csv "${dates[@]}"
+        return
+    fi
+
+    # Collect data
+    local latency_data token_data msg_data session_data configured_agents
+
+    latency_data=$(extract_latencies_from_logs "${dates[@]}" | calc_percentiles)
+    token_data=$(extract_session_metrics "${dates[@]}" | aggregate_tokens)
+    msg_data=$(count_messages_from_logs "${dates[@]}" | aggregate_messages)
+    session_data=$(count_active_sessions)
+    configured_agents=$(get_configured_agents)
+
+    # Render
+    render_header "$period_label"
+    render_kpi_latency "$latency_data"
+    render_kpi_tokens "$token_data"
+    render_kpi_messages "$msg_data"
+    render_kpi_sessions "$session_data"
+    render_kpi_availability "$configured_agents"
+
+    echo -e "${C_DIM}  ${SEPARATOR}${C_RESET}"
+    echo -e "${C_DIM}  Fontes: agent-chat logs (${LOG_DIR}/) + sessions JSONL (${AGENTS_DIR}/)${C_RESET}"
+    echo -e "${C_DIM}  Gerado em: $(date '+%Y-%m-%d %H:%M:%S')${C_RESET}"
+    echo ""
+}
+
+main

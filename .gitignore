@@ -1,0 +1,26 @@
+node_modules/
+.env
+*.sqlite
+*.db
+sessions/
+logs/
+*.log
+*.jsonl
+package-lock.json
+
+# ServCom dados sensiveis
+servcom-docker/import/
+servcom-docker/iris-data/
+servcom-reverse/*.xml
+servcom-reverse/scripts-*/
+*.DAT
+*.GOF
+*.OBJ
+
+# Temp
+.DS_Store
+*.swp
+*~
+.unifier-processed.json
+*.csv
+*.bak*

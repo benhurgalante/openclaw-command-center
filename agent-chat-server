@@ -1,0 +1,2279 @@
+#!/usr/bin/env node
+// agent-chat-server — WebSocket bridge for OpenClaw agent-chat logs
+// Serves real-time chat data to the frontend on port 18790
+// Zero npm dependencies — uses only Node.js built-in modules
+
+const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+
+// ---------------------------------------------------------------------------
+// PostgreSQL-backed API modules (CRM, Financial, RAG, Core)
+// ---------------------------------------------------------------------------
+const { MiniRouter, parseQuery, readJsonBody } = require("./mini-router");
+const { registerCoreRoutes } = require("./api-core");
+const { registerCrmRoutes } = require("./api-crm");
+const { registerFinRoutes } = require("./api-fin");
+const { registerRagRoutes } = require("./api-rag");
+const { registerGrowthRoutes, startSyncScheduler } = require("./api-growth");
+const { registerOperatorRoutes } = require("./api-operator");
+const { registerReconciliationRoutes } = require("./api-reconciliation");
+const { registerDataUnifierRoutes } = require("./api-data-unifier");
+const dbMod = require("./db");
+
+const pgRouter = new MiniRouter();
+registerCoreRoutes(pgRouter);
+registerCrmRoutes(pgRouter);
+registerFinRoutes(pgRouter);
+registerRagRoutes(pgRouter);
+registerGrowthRoutes(pgRouter);
+registerOperatorRoutes(pgRouter);
+registerReconciliationRoutes(pgRouter);
+registerDataUnifierRoutes(pgRouter);
+startSyncScheduler();
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+const PORT = parseInt(process.env.AGENT_CHAT_PORT || "18790", 10);
+const HOME = process.env.HOME || "/home/benhur";
+const LOGS_DIR = path.join(HOME, ".openclaw/agent-chats/logs");
+const ENFORCEMENT_LOG = path.join(HOME, ".openclaw/logs/enforcement.log");
+const RETRIES_JSON = path.join(
+  HOME,
+  ".openclaw/workspace-maestro/.orchestration/retries.json"
+);
+const RBAC_AUDIT_LOG = path.join(HOME, ".openclaw/logs/rbac-audit.log");
+const ORCHESTRATION_DIR = path.join(HOME, ".openclaw/workspace-maestro/.orchestration");
+const EVOLUTION_FILE = path.join(ORCHESTRATION_DIR, "evolution.json");
+const INCIDENTS_FILE = path.join(ORCHESTRATION_DIR, "incidents.json");
+const GROWTH_DIR = path.join(HOME, ".openclaw/workspace-ads/.growth");
+const GROWTH_CALENDAR_FILE = path.join(GROWTH_DIR, "calendar.json");
+const GROWTH_METRICS_FILE = path.join(GROWTH_DIR, "metrics.json");
+const GROWTH_BENCHMARK_FILE = path.join(GROWTH_DIR, "benchmark.json");
+try { fs.mkdirSync(GROWTH_DIR, { recursive: true }); } catch {}
+
+// ---------------------------------------------------------------------------
+// Chat log parser — converts markdown logs to structured JSON
+// ---------------------------------------------------------------------------
+function parseChatLog(content, filename) {
+  const messages = [];
+  const basename = path.basename(filename, ".md");
+
+  // Header: "# Chat: terminal ↔ maestro"
+  const headerMatch = content.match(
+    /^#\s+Chat:\s+(\S+)\s+.*?\s+(\S+)\s*$/m
+  );
+  const agents = headerMatch
+    ? [headerMatch[1], headerMatch[2]]
+    : basename.replace(/^\d{4}-\d{2}-\d{2}-/, "").split("-");
+
+  // Date from header or filename
+  const dateMatch =
+    content.match(/\*\*Data:\*\*\s*(\S+)/) ||
+    basename.match(/^(\d{4}-\d{2}-\d{2})/);
+  const date = dateMatch ? dateMatch[1] : new Date().toISOString().slice(0, 10);
+
+  // Parse messages: ### [HH:MM:SS] agent
+  const msgRegex = /^###\s+\[(\d{2}:\d{2}:\d{2})\]\s+(\S+)\s*$/gm;
+  let match;
+  const positions = [];
+
+  while ((match = msgRegex.exec(content)) !== null) {
+    positions.push({
+      time: match[1],
+      agent: match[2],
+      startIndex: match.index + match[0].length,
+    });
+  }
+
+  for (let i = 0; i < positions.length; i++) {
+    const pos = positions[i];
+    const endIndex =
+      i + 1 < positions.length ? positions[i + 1].startIndex : content.length;
+
+    // Grab text between this header and the next (or EOF), trim whitespace
+    const bodyStart = pos.startIndex;
+    const rawBody = content.slice(bodyStart, endIndex);
+    // Remove trailing ### line that belongs to next message
+    const body = rawBody.replace(/\n###\s+\[.*$/, "").trim();
+
+    messages.push({
+      id: `${basename}-${i}`,
+      timestamp: `${date}T${pos.time}`,
+      agent: pos.agent,
+      body,
+      chat: basename,
+    });
+  }
+
+  return { chat: basename, date, agents, messages };
+}
+
+// ---------------------------------------------------------------------------
+// File readers
+// ---------------------------------------------------------------------------
+function readChatLogs(agentFilter) {
+  const results = [];
+  let files;
+  try {
+    files = fs.readdirSync(LOGS_DIR).filter((f) => f.endsWith(".md"));
+  } catch {
+    return results;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  for (const file of files) {
+    // Only today's logs by default
+    if (!file.startsWith(today)) continue;
+
+    const filepath = path.join(LOGS_DIR, file);
+    try {
+      const content = fs.readFileSync(filepath, "utf-8");
+      const parsed = parseChatLog(content, file);
+
+      if (agentFilter) {
+        const lower = agentFilter.toLowerCase();
+        if (
+          !parsed.agents.some((a) => a.toLowerCase() === lower) &&
+          !parsed.messages.some((m) => m.agent.toLowerCase() === lower)
+        ) {
+          continue;
+        }
+      }
+
+      results.push(parsed);
+    } catch {
+      // skip unreadable files
+    }
+  }
+
+  return results;
+}
+
+function readEnforcementLog() {
+  try {
+    const raw = fs.readFileSync(ENFORCEMENT_LOG, "utf-8").trim();
+    if (!raw) return [];
+    return raw.split("\n").map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return { raw: line };
+      }
+    });
+  } catch {
+    return [];
+  }
+}
+
+function readRetries() {
+  try {
+    return JSON.parse(fs.readFileSync(RETRIES_JSON, "utf-8"));
+  } catch {
+    return { version: 1, updatedAt: null, tasks: {} };
+  }
+}
+
+// Read request body as JSON
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+      if (data.length > 256 * 1024) {
+        reject(new Error("Payload too large"));
+        req.destroy();
+      }
+    });
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(data));
+      } catch {
+        reject(new Error("Invalid JSON"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+// Send message to agent via openclaw CLI
+function sendAgentMessage(agentId, message) {
+  const { execSync } = require("node:child_process");
+  try {
+    const ocBin = path.join(HOME, ".npm-global/bin/openclaw");
+    const escaped = message.replace(/'/g, "'\\''");
+    const result = execSync(
+      `${ocBin} agent --agent ${agentId} --message '${escaped}' --json`,
+      { timeout: 120000, encoding: "utf-8", env: { ...process.env, HOME, PATH: `${HOME}/.npm-global/bin:${HOME}/.local/bin:${process.env.PATH || "/usr/bin"}` } }
+    );
+    return { success: true, response: result.trim() };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// Fetch OpenClaw system status
+function getSystemStatus() {
+  const { execSync } = require("node:child_process");
+  try {
+    const ocBin = path.join(HOME, ".npm-global/bin/openclaw");
+    const raw = execSync(`${ocBin} status --json`, {
+      timeout: 15000,
+      encoding: "utf-8",
+      env: { ...process.env, HOME, PATH: `${HOME}/.npm-global/bin:${HOME}/.local/bin:${process.env.PATH || "/usr/bin"}` },
+    });
+    const data = JSON.parse(raw);
+    return {
+      gateway: {
+        mode: data.gateway?.mode || "unknown",
+        reachable: data.gateway?.reachable || false,
+        latencyMs: data.gateway?.connectLatencyMs || null,
+        version: data.gateway?.self?.version || "unknown",
+        host: data.gateway?.self?.host || "unknown",
+        platform: data.gateway?.self?.platform || "unknown",
+      },
+      update: {
+        current: data.gateway?.self?.version || "unknown",
+        latest: data.update?.registry?.latestVersion || "unknown",
+        updateAvailable:
+          data.gateway?.self?.version !== data.update?.registry?.latestVersion,
+      },
+      agents: {
+        total: (data.heartbeat?.agents || []).length,
+        heartbeatEnabled: (data.heartbeat?.agents || []).filter(
+          (a) => a.enabled
+        ).length,
+        defaultAgent: data.heartbeat?.defaultAgentId || "maestro",
+      },
+      channels: data.channels || {},
+      sessions: {
+        count: (data.sessions?.paths || []).length,
+      },
+    };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sessions & Agents data (via CLI)
+// ---------------------------------------------------------------------------
+function getSessionsList() {
+  const { execSync } = require("node:child_process");
+  try {
+    const ocBin = path.join(HOME, ".npm-global/bin/openclaw");
+    const envPath = `${HOME}/.npm-global/bin:${HOME}/.local/bin:${process.env.PATH || "/usr/bin"}`;
+    const raw = execSync(`${ocBin} sessions list --json`, {
+      timeout: 15000, encoding: "utf-8",
+      env: { ...process.env, HOME, PATH: envPath },
+    });
+    return JSON.parse(raw);
+  } catch {
+    return { sessions: [], error: "unavailable" };
+  }
+}
+
+function getAgentsList() {
+  const { execSync } = require("node:child_process");
+  const fs = require("node:fs");
+  try {
+    const ocBin = path.join(HOME, ".npm-global/bin/openclaw");
+    const envPath = `${HOME}/.npm-global/bin:${HOME}/.local/bin:${process.env.PATH || "/usr/bin"}`;
+    const raw = execSync(`${ocBin} agents list --json`, {
+      timeout: 15000, encoding: "utf-8",
+      env: { ...process.env, HOME, PATH: envPath },
+    });
+    const agents = JSON.parse(raw);
+
+    // Enrich each agent with IDENTITY.md data + operational metrics
+    const chats = readChatLogs();
+    const msgCounts = {};
+    for (const chat of chats) {
+      for (const msg of (chat.messages || [])) {
+        const ag = (msg.agent || "").toLowerCase();
+        msgCounts[ag] = (msgCounts[ag] || 0) + 1;
+      }
+    }
+
+    // Sector mapping (from organogram)
+    const sectorMap = {
+      maestro: "CEO", sysdev: "CTO", coder: "CTO", clawdev: "CTO", designer: "CTO",
+      cio: "CIO", terminal: "CIO",
+      flow: "COO", ops: "COO", briefer: "COO", concierge: "COO", travel: "COO",
+      finance: "CFO", analyst: "CFO", deals: "CFO",
+      ads: "CMO", sales: "CMO", copywriter: "CMO", creator: "CMO", "social-media": "CMO", "video-studio": "CMO",
+      hr: "CHRO", advisor: "CHRO", stylist: "CHRO",
+      juris: "CLO",
+      sentinel: "CCO", scout: "CCO",
+    };
+
+    const enriched = (Array.isArray(agents) ? agents : []).map(a => {
+      const id = (a.id || "").toLowerCase();
+      // Read IDENTITY.md
+      let role = "";
+      let cargo = "";
+      try {
+        const ws = a.workspace || "";
+        const idFile = path.join(ws, "IDENTITY.md");
+        if (fs.existsSync(idFile)) {
+          const content = fs.readFileSync(idFile, "utf-8").slice(0, 1000);
+          const cargoMatch = content.match(/Cargo:\s*(.+)/i);
+          if (cargoMatch) cargo = cargoMatch[1].trim();
+          const roleMatch = content.match(/Role:\s*(.+)/i);
+          if (roleMatch) role = roleMatch[1].trim().slice(0, 120);
+        }
+      } catch {}
+
+      return {
+        ...a,
+        sector: sectorMap[id] || "—",
+        cargo: cargo || "—",
+        role: role || "—",
+        messages: msgCounts[id] || 0,
+        status: "ready",
+      };
+    });
+
+    return enriched;
+  } catch {
+    return [];
+  }
+}
+
+let _sessionsCache = null;
+let _sessionsCacheTime = 0;
+function getCachedSessions() {
+  const now = Date.now();
+  if (_sessionsCache && now - _sessionsCacheTime < 15000) return _sessionsCache;
+  _sessionsCache = getSessionsList();
+  _sessionsCacheTime = now;
+  return _sessionsCache;
+}
+
+let _agentsCache = null;
+let _agentsCacheTime = 0;
+function getCachedAgents() {
+  const now = Date.now();
+  if (_agentsCache && now - _agentsCacheTime < 30000) return _agentsCache;
+  _agentsCache = getAgentsList();
+  _agentsCacheTime = now;
+  return _agentsCache;
+}
+
+// ---------------------------------------------------------------------------
+// Operational actions
+// ---------------------------------------------------------------------------
+function executeAction(action, params) {
+  const { execSync } = require("node:child_process");
+  const ocBin = path.join(HOME, ".npm-global/bin/openclaw");
+  const envPath = `${HOME}/.npm-global/bin:${HOME}/.local/bin:${process.env.PATH || "/usr/bin"}`;
+  const execOpts = { timeout: 30000, encoding: "utf-8", env: { ...process.env, HOME, PATH: envPath } };
+
+  const timestamp = new Date().toISOString();
+  let result;
+
+  switch (action) {
+    case "gateway-restart":
+      try {
+        execSync(`${ocBin} gateway restart`, execOpts);
+        result = { success: true, action, timestamp, message: "Gateway restart initiated" };
+      } catch (err) {
+        result = { success: false, action, timestamp, error: err.message };
+      }
+      break;
+
+    case "send-message":
+      if (!params.agentId || !params.message) {
+        throw new Error("agentId and message required");
+      }
+      result = sendAgentMessage(params.agentId, params.message);
+      result.action = action;
+      result.timestamp = timestamp;
+      break;
+
+    default:
+      throw new Error(`Unknown action: ${action}`);
+  }
+
+  // Audit log
+  const auditEntry = JSON.stringify({ ...result, params: { ...params, message: params.message ? "[REDACTED]" : undefined } });
+  try {
+    fs.appendFileSync(path.join(HOME, ".openclaw/logs/command-center-audit.log"), auditEntry + "\n");
+  } catch {}
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Unified timeline
+// ---------------------------------------------------------------------------
+function getTimeline() {
+  const events = [];
+
+  // Enforcement events
+  try {
+    const raw = fs.readFileSync(ENFORCEMENT_LOG, "utf-8");
+    const lines = raw.trim().split("\n").slice(-50);
+    for (const line of lines) {
+      try {
+        const ev = JSON.parse(line);
+        events.push({
+          type: "enforcement",
+          timestamp: ev.timestamp || ev.ts,
+          agent: ev.agentId || ev.agent,
+          decision: ev.decision,
+          reason: ev.reason_code || ev.reason,
+        });
+      } catch {}
+    }
+  } catch {}
+
+  // Retry events
+  try {
+    const raw = fs.readFileSync(RETRIES_JSON, "utf-8");
+    const data = JSON.parse(raw);
+    for (const [taskId, task] of Object.entries(data.tasks || {})) {
+      events.push({
+        type: "retry",
+        timestamp: task.updatedAt || task.createdAt,
+        taskId,
+        status: task.status,
+        retryCount: task.retryCount,
+        agent: task.agent,
+      });
+    }
+  } catch {}
+
+  // Chat messages (last 20)
+  const chats = readChatLogs(null);
+  const recentMsgs = chats.slice(-20);
+  for (const msg of recentMsgs) {
+    events.push({
+      type: "chat",
+      timestamp: msg.timestamp || `${msg.date}T${msg.time}`,
+      agent: msg.from,
+      to: msg.to,
+      preview: (msg.content || "").slice(0, 80),
+    });
+  }
+
+  // Sort by timestamp desc
+  events.sort((a, b) => {
+    const ta = new Date(a.timestamp || 0).getTime();
+    const tb = new Date(b.timestamp || 0).getTime();
+    return tb - ta;
+  });
+
+  return { events: events.slice(0, 100), count: events.length };
+}
+
+// ---------------------------------------------------------------------------
+// Retention + Archiving (7/30/90 day policy)
+// ---------------------------------------------------------------------------
+const ARCHIVE_DIR = path.join(HOME, ".openclaw/archive");
+const RETENTION_POLICY = { hot: 7, warm: 30, cold: 90 }; // days
+
+function ensureArchiveDir() {
+  try { fs.mkdirSync(ARCHIVE_DIR, { recursive: true }); } catch {}
+}
+
+function getRetentionStats() {
+  ensureArchiveDir();
+  const now = Date.now();
+  const dayMs = 86400000;
+
+  // Count chat log files by age
+  let hotFiles = 0, warmFiles = 0, coldFiles = 0, archivedFiles = 0;
+  try {
+    const logFiles = fs.readdirSync(LOGS_DIR).filter(f => f.endsWith(".md"));
+    for (const f of logFiles) {
+      const dateMatch = f.match(/^(\d{4}-\d{2}-\d{2})/);
+      if (!dateMatch) { hotFiles++; continue; }
+      const ageDays = (now - new Date(dateMatch[1]).getTime()) / dayMs;
+      if (ageDays <= RETENTION_POLICY.hot) hotFiles++;
+      else if (ageDays <= RETENTION_POLICY.warm) warmFiles++;
+      else coldFiles++;
+    }
+  } catch {}
+
+  try {
+    archivedFiles = fs.readdirSync(ARCHIVE_DIR).length;
+  } catch {}
+
+  // Enforcement log size
+  let enforcementSizeKB = 0;
+  try { enforcementSizeKB = Math.round(fs.statSync(ENFORCEMENT_LOG).size / 1024); } catch {}
+
+  return {
+    policy: RETENTION_POLICY,
+    chatLogs: { hot: hotFiles, warm: warmFiles, cold: coldFiles, archived: archivedFiles },
+    enforcementLog: { sizeKB: enforcementSizeKB },
+    archiveDir: ARCHIVE_DIR,
+  };
+}
+
+function runRetentionArchive() {
+  ensureArchiveDir();
+  const now = Date.now();
+  const dayMs = 86400000;
+  let archived = 0, errors = 0;
+
+  try {
+    const logFiles = fs.readdirSync(LOGS_DIR).filter(f => f.endsWith(".md"));
+    for (const f of logFiles) {
+      const dateMatch = f.match(/^(\d{4}-\d{2}-\d{2})/);
+      if (!dateMatch) continue;
+      const ageDays = (now - new Date(dateMatch[1]).getTime()) / dayMs;
+      if (ageDays > RETENTION_POLICY.cold) {
+        try {
+          fs.renameSync(path.join(LOGS_DIR, f), path.join(ARCHIVE_DIR, f));
+          archived++;
+        } catch { errors++; }
+      }
+    }
+  } catch { errors++; }
+
+  // Trim enforcement log if > 1MB (keep last 500 lines)
+  let enforcementTrimmed = false;
+  try {
+    const stat = fs.statSync(ENFORCEMENT_LOG);
+    if (stat.size > 1048576) {
+      const lines = fs.readFileSync(ENFORCEMENT_LOG, "utf-8").trim().split("\n");
+      fs.writeFileSync(ENFORCEMENT_LOG, lines.slice(-500).join("\n") + "\n");
+      enforcementTrimmed = true;
+    }
+  } catch {}
+
+  return { archived, errors, enforcementTrimmed, timestamp: new Date().toISOString() };
+}
+
+// ---------------------------------------------------------------------------
+// Kanban Tasks (persistent JSON store)
+// ---------------------------------------------------------------------------
+const KANBAN_FILE = path.join(HOME, ".openclaw/workspace-maestro/.orchestration/kanban.json");
+const KANBAN_COLUMNS = ["backlog", "execucao", "qa_gate", "aprovado", "concluido"];
+
+function loadKanban() {
+  try {
+    const raw = fs.readFileSync(KANBAN_FILE, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return { version: 1, updatedAt: new Date().toISOString(), tasks: {} };
+  }
+}
+
+function saveKanban(data) {
+  data.updatedAt = new Date().toISOString();
+  fs.writeFileSync(KANBAN_FILE, JSON.stringify(data, null, 2));
+}
+
+function kanbanCreateTask(params) {
+  const data = loadKanban();
+  const id = params.id || `task-${Date.now()}`;
+  if (data.tasks[id]) throw new Error(`Task ${id} already exists`);
+  data.tasks[id] = {
+    id,
+    title: params.title || "Untitled",
+    owner: params.owner || null,
+    priority: params.priority || "P1",
+    column: "backlog",
+    attempts: 0,
+    maxRetries: 3,
+    evidence: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    movedAt: new Date().toISOString(),
+    history: [{ action: "created", column: "backlog", at: new Date().toISOString() }],
+  };
+  saveKanban(data);
+  return data.tasks[id];
+}
+
+function kanbanMoveTask(taskId, toColumn) {
+  if (!KANBAN_COLUMNS.includes(toColumn)) throw new Error(`Invalid column: ${toColumn}`);
+  const data = loadKanban();
+  const task = data.tasks[taskId];
+  if (!task) throw new Error(`Task ${taskId} not found`);
+
+  // Quality gate check: can't move to 'aprovado' without evidence
+  if (toColumn === "aprovado" && (!task.evidence || task.evidence.length === 0)) {
+    throw new Error("Cannot approve: evidence gate requires at least one evidence entry");
+  }
+
+  // Retry limit check
+  if (toColumn === "execucao" && task.attempts >= task.maxRetries) {
+    throw new Error(`Task ${taskId} exceeded max retries (${task.maxRetries}). Escalate to human.`);
+  }
+
+  const fromColumn = task.column;
+  task.column = toColumn;
+  task.updatedAt = new Date().toISOString();
+  task.movedAt = new Date().toISOString();
+  if (toColumn === "execucao") task.attempts++;
+  task.history.push({ action: "moved", from: fromColumn, to: toColumn, at: new Date().toISOString() });
+  saveKanban(data);
+  return task;
+}
+
+function kanbanAddEvidence(taskId, evidence) {
+  const data = loadKanban();
+  const task = data.tasks[taskId];
+  if (!task) throw new Error(`Task ${taskId} not found`);
+  task.evidence.push({ text: evidence, at: new Date().toISOString() });
+  task.updatedAt = new Date().toISOString();
+  task.history.push({ action: "evidence_added", at: new Date().toISOString() });
+  saveKanban(data);
+  return task;
+}
+
+function kanbanUpdateTask(taskId, updates) {
+  const data = loadKanban();
+  const task = data.tasks[taskId];
+  if (!task) throw new Error(`Task ${taskId} not found`);
+  if (updates.title) task.title = updates.title;
+  if (updates.owner) task.owner = updates.owner;
+  if (updates.priority) task.priority = updates.priority;
+  task.updatedAt = new Date().toISOString();
+  saveKanban(data);
+  return task;
+}
+
+function kanbanGetBoard() {
+  const data = loadKanban();
+  const board = {};
+  for (const col of KANBAN_COLUMNS) board[col] = [];
+  for (const task of Object.values(data.tasks)) {
+    const col = task.column || "backlog";
+    if (board[col]) board[col].push(task);
+  }
+  // Sort by priority then age
+  for (const col of KANBAN_COLUMNS) {
+    board[col].sort((a, b) => {
+      const pa = a.priority || "P2";
+      const pb = b.priority || "P2";
+      if (pa !== pb) return pa.localeCompare(pb);
+      return new Date(a.createdAt) - new Date(b.createdAt);
+    });
+  }
+  return { columns: KANBAN_COLUMNS, board, taskCount: Object.keys(data.tasks).length, updatedAt: data.updatedAt };
+}
+
+// Seed kanban from sprint/backlog if empty
+function seedKanbanIfEmpty() {
+  const data = loadKanban();
+  if (Object.keys(data.tasks).length > 0) return;
+
+  // Seed from Sprint 002
+  const seeds = [
+    { id: "sprint002-skills-diag", title: "Skills Diagnostics v1", owner: "SysDev", priority: "P0" },
+    { id: "sprint002-integration-18789", title: "Integração Fase A no painel 18789", owner: "Coder", priority: "P0" },
+    { id: "sprint002-hardening", title: "Hardening release público", owner: "Sentinel", priority: "P0" },
+    { id: "sprint002-graph-shadow", title: "Graph Orchestration Shadow Pilot", owner: "ClawDev", priority: "P1" },
+    { id: "sprint002-metrics-dash", title: "Metrics Dashboard v1 (SLOs + alertas)", owner: "Coder", priority: "P1" },
+    { id: "sprint002-mcp-github", title: "MCPorter + GitHub MCP em Coder/SysDev", owner: "SysDev", priority: "P2" },
+    { id: "sprint002-shoelace", title: "Shoelace MVP inicial", owner: "Designer", priority: "P2" },
+    { id: "command-center-v1", title: "Command Center v1", owner: "Terminal", priority: "P0" },
+    { id: "ollama-integration", title: "Ollama LLM local integrado", owner: "Terminal", priority: "P0" },
+    { id: "routing-policy", title: "Routing Policy por complexidade", owner: "Terminal", priority: "P1" },
+    { id: "backlog-sessions-control", title: "Sessions control no frontend", owner: "Coder", priority: "P1" },
+    { id: "backlog-agent-ops", title: "Agent ops visual no frontend", owner: "Coder", priority: "P1" },
+  ];
+
+  for (const seed of seeds) {
+    data.tasks[seed.id] = {
+      ...seed,
+      column: "backlog",
+      attempts: 0,
+      maxRetries: 3,
+      evidence: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      movedAt: new Date().toISOString(),
+      history: [{ action: "seeded", column: "backlog", at: new Date().toISOString() }],
+    };
+  }
+
+  // Mark completed items
+  const completed = ["command-center-v1", "ollama-integration"];
+  for (const id of completed) {
+    if (data.tasks[id]) {
+      data.tasks[id].column = "concluido";
+      data.tasks[id].evidence = [{ text: "Implementado e validado em produção", at: new Date().toISOString() }];
+    }
+  }
+
+  // Move delivered items to qa_gate
+  const delivered = ["sprint002-skills-diag", "sprint002-integration-18789", "sprint002-hardening", "sprint002-metrics-dash", "sprint002-mcp-github"];
+  for (const id of delivered) {
+    if (data.tasks[id]) {
+      data.tasks[id].column = "qa_gate";
+      data.tasks[id].attempts = 1;
+    }
+  }
+
+  saveKanban(data);
+}
+
+// Seed on startup
+try { seedKanbanIfEmpty(); } catch {}
+
+// Cache system status (expensive call)
+let _statusCache = null;
+let _statusCacheTime = 0;
+const STATUS_CACHE_TTL = 30000; // 30s
+
+function getCachedStatus() {
+  const now = Date.now();
+  if (_statusCache && now - _statusCacheTime < STATUS_CACHE_TTL) {
+    return _statusCache;
+  }
+  _statusCache = getSystemStatus();
+  _statusCacheTime = now;
+  return _statusCache;
+}
+
+// Compute metrics from chat logs
+function computeMetrics() {
+  const chats = readChatLogs(null);
+  const agentMsgCount = {};
+  let totalMessages = 0;
+  const agentSet = new Set();
+
+  for (const chat of chats) {
+    for (const msg of chat.messages) {
+      agentMsgCount[msg.agent] = (agentMsgCount[msg.agent] || 0) + 1;
+      agentSet.add(msg.agent);
+      totalMessages++;
+    }
+    for (const a of chat.agents) agentSet.add(a);
+  }
+
+  const enforcement = readEnforcementLog();
+  const retries = readRetries();
+  const activeRetries = Object.values(retries.tasks || {}).filter(
+    (t) => t.status === "active" || t.status === "retrying"
+  ).length;
+  const escalations = Object.values(retries.tasks || {}).filter(
+    (t) => t.status === "escalated"
+  ).length;
+
+  return {
+    activeAgents: agentSet.size,
+    totalMessages,
+    messagesByAgent: agentMsgCount,
+    totalChats: chats.length,
+    enforcementEvents: enforcement.length,
+    activeRetries,
+    escalations,
+    wsClients: wsClients.size,
+    uptime: process.uptime(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket helpers (RFC 6455 minimal implementation)
+// ---------------------------------------------------------------------------
+function computeAcceptKey(key) {
+  return crypto
+    .createHash("sha1")
+    .update(key + "258EAFA5-E914-47DA-95CA-5AB5AE11E54E")
+    .digest("base64");
+}
+
+function encodeFrame(data) {
+  const payload =
+    typeof data === "string" ? Buffer.from(data, "utf-8") : data;
+  const len = payload.length;
+  let header;
+
+  if (len < 126) {
+    header = Buffer.alloc(2);
+    header[0] = 0x81; // FIN + text opcode
+    header[1] = len;
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x81;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+
+  return Buffer.concat([header, payload]);
+}
+
+function decodeFrame(buf) {
+  if (buf.length < 2) return null;
+  const opcode = buf[0] & 0x0f;
+  const masked = (buf[1] & 0x80) !== 0;
+  let payloadLen = buf[1] & 0x7f;
+  let offset = 2;
+
+  if (payloadLen === 126) {
+    if (buf.length < 4) return null;
+    payloadLen = buf.readUInt16BE(2);
+    offset = 4;
+  } else if (payloadLen === 127) {
+    if (buf.length < 10) return null;
+    payloadLen = Number(buf.readBigUInt64BE(2));
+    offset = 10;
+  }
+
+  let mask = null;
+  if (masked) {
+    if (buf.length < offset + 4) return null;
+    mask = buf.slice(offset, offset + 4);
+    offset += 4;
+  }
+
+  if (buf.length < offset + payloadLen) return null;
+  const payload = buf.slice(offset, offset + payloadLen);
+
+  if (mask) {
+    for (let i = 0; i < payload.length; i++) {
+      payload[i] ^= mask[i % 4];
+    }
+  }
+
+  return { opcode, payload, totalLength: offset + payloadLen };
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket client tracking
+// ---------------------------------------------------------------------------
+const wsClients = new Set();
+
+function broadcast(data) {
+  const json = typeof data === "string" ? data : JSON.stringify(data);
+  const frame = encodeFrame(json);
+  for (const client of wsClients) {
+    try {
+      client.write(frame);
+    } catch {
+      wsClients.delete(client);
+    }
+  }
+}
+
+function sendPing(socket) {
+  try {
+    const pingFrame = Buffer.alloc(2);
+    pingFrame[0] = 0x89; // FIN + ping
+    pingFrame[1] = 0;
+    socket.write(pingFrame);
+  } catch {
+    // ignore
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rate Limiting (per-IP, sliding window)
+// ---------------------------------------------------------------------------
+const rateLimitMap = new Map(); // ip -> { count, resetAt }
+const RATE_LIMIT_WINDOW = 60000; // 1 minute
+const RATE_LIMIT_MAX = 120; // requests per window
+const RATE_LIMIT_WS_MAX = 60; // WS messages per window per client
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  let entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW };
+    rateLimitMap.set(ip, entry);
+  }
+  entry.count++;
+  if (entry.count > RATE_LIMIT_MAX) {
+    return { allowed: false, remaining: 0, retryAfter: Math.ceil((entry.resetAt - now) / 1000) };
+  }
+  return { allowed: true, remaining: RATE_LIMIT_MAX - entry.count };
+}
+
+// Cleanup stale entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of rateLimitMap) {
+    if (now > entry.resetAt) rateLimitMap.delete(ip);
+  }
+}, 300000);
+
+// ---------------------------------------------------------------------------
+// SLO Tracking
+// ---------------------------------------------------------------------------
+const sloMetrics = {
+  requestCount: 0,
+  errorCount: 0, // 4xx + 5xx
+  latencies: [], // last 100 request durations in ms
+  wsConnections: 0,
+  wsDisconnections: 0,
+  startedAt: Date.now(),
+};
+
+// ---------------------------------------------------------------------------
+// Observability — per-endpoint metrics + frontend error tracking
+// ---------------------------------------------------------------------------
+const obsMetrics = {
+  endpoints: {},        // { "/api/status": { count, totalMs, errors, p95s: [] } }
+  frontendErrors: [],   // last 50 JS errors reported by dashboard
+  renderTimes: [],      // last 100 render cycle times reported by dashboard
+  wsReconnects: 0,
+};
+
+function recordEndpointMetric(pathname, durationMs, statusCode) {
+  if (!obsMetrics.endpoints[pathname]) {
+    obsMetrics.endpoints[pathname] = { count: 0, totalMs: 0, errors: 0, latencies: [] };
+  }
+  const ep = obsMetrics.endpoints[pathname];
+  ep.count++;
+  ep.totalMs += durationMs;
+  if (statusCode >= 400) ep.errors++;
+  ep.latencies.push(durationMs);
+  if (ep.latencies.length > 50) ep.latencies.shift();
+}
+
+function getObservability() {
+  const epSummary = {};
+  for (const [ep, m] of Object.entries(obsMetrics.endpoints)) {
+    const sorted = m.latencies.slice().sort((a, b) => a - b);
+    const p50 = sorted.length > 0 ? sorted[Math.floor(sorted.length * 0.5)] : 0;
+    const p95 = sorted.length > 0 ? sorted[Math.floor(sorted.length * 0.95)] : 0;
+    epSummary[ep] = {
+      count: m.count,
+      avgMs: m.count > 0 ? Math.round(m.totalMs / m.count) : 0,
+      p50, p95,
+      errors: m.errors,
+      errorRate: m.count > 0 ? (m.errors / m.count * 100).toFixed(1) + "%" : "0%",
+    };
+  }
+  const renderSorted = obsMetrics.renderTimes.slice().sort((a, b) => a - b);
+  return {
+    server: {
+      uptime: process.uptime(),
+      memoryMB: Math.round(process.memoryUsage().rss / 1048576),
+      heapMB: Math.round(process.memoryUsage().heapUsed / 1048576),
+      wsClients: wsClients ? wsClients.size : 0,
+      wsReconnects: obsMetrics.wsReconnects,
+    },
+    endpoints: epSummary,
+    frontend: {
+      jsErrors: obsMetrics.frontendErrors.slice(-20),
+      renderTimes: {
+        samples: renderSorted.length,
+        p50: renderSorted.length > 0 ? renderSorted[Math.floor(renderSorted.length * 0.5)] : 0,
+        p95: renderSorted.length > 0 ? renderSorted[Math.floor(renderSorted.length * 0.95)] : 0,
+        last: renderSorted.length > 0 ? renderSorted[renderSorted.length - 1] : 0,
+      },
+    },
+    alerts: {
+      highServerMemory: process.memoryUsage().rss > 256 * 1048576,
+      slowRender: (renderSorted.length > 0 && renderSorted[Math.floor(renderSorted.length * 0.95)] > 2000),
+      highEndpointErrors: Object.values(epSummary).some(e => parseFloat(e.errorRate) > 10),
+    },
+  };
+}
+
+function recordLatency(ms) {
+  sloMetrics.latencies.push(ms);
+  if (sloMetrics.latencies.length > 100) sloMetrics.latencies.shift();
+}
+
+function computeSLOs() {
+  const lat = sloMetrics.latencies.slice().sort((a, b) => a - b);
+  const p50 = lat.length > 0 ? lat[Math.floor(lat.length * 0.5)] : 0;
+  const p95 = lat.length > 0 ? lat[Math.floor(lat.length * 0.95)] : 0;
+  const p99 = lat.length > 0 ? lat[Math.floor(lat.length * 0.99)] : 0;
+  const uptimeMs = Date.now() - sloMetrics.startedAt;
+  const errorRate = sloMetrics.requestCount > 0
+    ? (sloMetrics.errorCount / sloMetrics.requestCount * 100).toFixed(2)
+    : "0.00";
+
+  return {
+    uptime: {
+      ms: uptimeMs,
+      human: `${Math.floor(uptimeMs / 3600000)}h ${Math.floor((uptimeMs % 3600000) / 60000)}m`,
+    },
+    requests: {
+      total: sloMetrics.requestCount,
+      errors: sloMetrics.errorCount,
+      errorRate: `${errorRate}%`,
+    },
+    latency: {
+      p50: `${p50}ms`,
+      p95: `${p95}ms`,
+      p99: `${p99}ms`,
+      samples: lat.length,
+    },
+    websocket: {
+      activeClients: wsClients.size,
+      totalConnections: sloMetrics.wsConnections,
+      totalDisconnections: sloMetrics.wsDisconnections,
+    },
+    alerts: {
+      highErrorRate: parseFloat(errorRate) > 5,
+      highLatency: p95 > 5000,
+      noClients: wsClients.size === 0,
+    },
+    thresholds: {
+      errorRate: "< 5%",
+      p95Latency: "< 5000ms",
+      minWsClients: 0,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// RBAC + Audit (server-side enforcement)
+// ---------------------------------------------------------------------------
+const RBAC_ROLES = new Set(["admin", "operator", "viewer"]);
+const ADMIN_ONLY_ACTIONS = new Set([
+  "gateway-restart",
+  "go",
+  "no-go",
+  "gono-go",
+  "go-no-go",
+  "approve-release",
+  "rollback-release",
+]);
+
+function normalizeRole(value) {
+  const role = String(value || "").trim().toLowerCase();
+  return RBAC_ROLES.has(role) ? role : null;
+}
+
+function getActor(req) {
+  return (
+    req.headers["x-actor"] ||
+    req.headers["x-user"] ||
+    req.headers["x-agent-id"] ||
+    "anonymous"
+  );
+}
+
+function isReadMethod(method) {
+  return method === "GET" || method === "HEAD";
+}
+
+function isCriticalEndpoint(pathname) {
+  return (
+    pathname.startsWith("/api/actions") ||
+    pathname.startsWith("/api/kanban") ||
+    pathname.startsWith("/api/evolution") ||
+    pathname.startsWith("/api/incidents")
+  );
+}
+
+function auditRbac({ role, actor, decision, endpoint }) {
+  const entry = {
+    ts: new Date().toISOString(),
+    role: role || "unknown",
+    actor: actor || "anonymous",
+    decision,
+    endpoint,
+  };
+  try {
+    fs.appendFileSync(RBAC_AUDIT_LOG, JSON.stringify(entry) + "\n");
+  } catch {}
+}
+
+function authorizeRequest(req, pathname) {
+  if (!isCriticalEndpoint(pathname)) {
+    return { allowed: true, role: null, actor: getActor(req), reason: "non-critical" };
+  }
+
+  const role = normalizeRole(req.headers["x-role"] || req.headers["x-user-role"]);
+  const actor = getActor(req);
+  if (!role) {
+    return { allowed: false, role: "unknown", actor, reason: "missing_or_invalid_role_header" };
+  }
+
+  if (pathname.startsWith("/api/actions/")) {
+    const action = pathname.slice("/api/actions/".length).toLowerCase();
+    if (role === "viewer") return { allowed: false, role, actor, reason: "viewer_read_only" };
+    if (role === "operator" && ADMIN_ONLY_ACTIONS.has(action)) {
+      return { allowed: false, role, actor, reason: "operator_cannot_execute_admin_action" };
+    }
+    return { allowed: true, role, actor, reason: "ok" };
+  }
+
+  if (!isReadMethod(req.method) && role === "viewer") {
+    return { allowed: false, role, actor, reason: "viewer_read_only" };
+  }
+
+  return { allowed: true, role, actor, reason: "ok" };
+}
+
+// ---------------------------------------------------------------------------
+// Evolution + Incidents stores
+// ---------------------------------------------------------------------------
+function loadJsonStore(filePath, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function saveJsonStore(filePath, data) {
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+}
+
+function evolutionList() {
+  return loadJsonStore(EVOLUTION_FILE, { version: 1, updatedAt: null, events: [] });
+}
+
+function evolutionCreate(params) {
+  const data = evolutionList();
+  const event = {
+    id: params.id || `ev-${Date.now()}`,
+    title: params.title || "Untitled evolution event",
+    status: params.status || "proposed",
+    owner: params.owner || null,
+    notes: params.notes || "",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  data.events.unshift(event);
+  data.updatedAt = new Date().toISOString();
+  saveJsonStore(EVOLUTION_FILE, data);
+  return event;
+}
+
+function evolutionUpdate(eventId, updates) {
+  const data = evolutionList();
+  const event = (data.events || []).find((ev) => ev.id === eventId);
+  if (!event) throw new Error(`Evolution event ${eventId} not found`);
+  Object.assign(event, updates || {});
+  event.updatedAt = new Date().toISOString();
+  data.updatedAt = new Date().toISOString();
+  saveJsonStore(EVOLUTION_FILE, data);
+  return event;
+}
+
+function incidentsList() {
+  return loadJsonStore(INCIDENTS_FILE, { version: 1, updatedAt: null, incidents: [] });
+}
+
+function incidentsCreate(params) {
+  const data = incidentsList();
+  const incident = {
+    id: params.id || `inc-${Date.now()}`,
+    title: params.title || "Untitled incident",
+    severity: params.severity || "P2",
+    status: params.status || "open",
+    owner: params.owner || null,
+    summary: params.summary || "",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  data.incidents.unshift(incident);
+  data.updatedAt = new Date().toISOString();
+  saveJsonStore(INCIDENTS_FILE, data);
+  return incident;
+}
+
+function incidentsUpdate(incidentId, updates) {
+  const data = incidentsList();
+  const incident = (data.incidents || []).find((it) => it.id === incidentId);
+  if (!incident) throw new Error(`Incident ${incidentId} not found`);
+  Object.assign(incident, updates || {});
+  incident.updatedAt = new Date().toISOString();
+  data.updatedAt = new Date().toISOString();
+  saveJsonStore(INCIDENTS_FILE, data);
+  return incident;
+}
+
+// ---------------------------------------------------------------------------
+// CORS helper
+// ---------------------------------------------------------------------------
+function setCors(res) {
+  const origin = res._req?.headers?.origin || "";
+  const allowed = [
+    "http://localhost:18789",
+    "http://localhost:18790",
+    "http://127.0.0.1:18789",
+    "http://127.0.0.1:18790",
+  ];
+  const match = allowed.includes(origin) ? origin : allowed[0];
+  res.setHeader("Access-Control-Allow-Origin", match);
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-role, x-actor, x-user, x-tenant-id");
+}
+
+function jsonResponse(res, data, status = 200) {
+  setCors(res);
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(data, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// HTML test page
+// ---------------------------------------------------------------------------
+function testPageHtml() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Chat Bridge</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+           background: #0d1117; color: #c9d1d9; padding: 1.5rem; }
+    h1 { color: #58a6ff; margin-bottom: 0.5rem; font-size: 1.4rem; }
+    .status { padding: 0.5rem 1rem; border-radius: 6px; margin-bottom: 1rem;
+              font-weight: 600; display: inline-block; }
+    .connected { background: #0d4429; color: #3fb950; }
+    .disconnected { background: #490b11; color: #f85149; }
+    .info { color: #8b949e; font-size: 0.85rem; margin-bottom: 1rem; }
+    #messages { max-height: 70vh; overflow-y: auto; border: 1px solid #30363d;
+                border-radius: 8px; padding: 1rem; background: #161b22; }
+    .msg { margin-bottom: 0.75rem; padding: 0.5rem 0.75rem; border-left: 3px solid #30363d;
+           background: #0d1117; border-radius: 4px; }
+    .msg .agent { color: #58a6ff; font-weight: 700; }
+    .msg .time { color: #8b949e; font-size: 0.8rem; margin-left: 0.5rem; }
+    .msg .body { margin-top: 0.25rem; white-space: pre-wrap; font-size: 0.9rem; }
+    .msg.enforcement { border-left-color: #f0883e; }
+    .endpoints { margin: 1rem 0; padding: 1rem; background: #161b22;
+                 border-radius: 8px; border: 1px solid #30363d; }
+    .endpoints code { color: #f0883e; }
+    .endpoints a { color: #58a6ff; text-decoration: none; }
+    .endpoints a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>Agent Chat Bridge</h1>
+  <div id="statusBadge" class="status disconnected">Disconnected</div>
+  <p class="info">WebSocket port ${PORT} &mdash; bridging agent-chat logs to the OpenClaw frontend</p>
+
+  <div class="endpoints">
+    <strong>REST Endpoints:</strong><br>
+    <a href="/api/chats">/api/chats</a> &mdash; today's chat data<br>
+    <a href="/api/enforcement">/api/enforcement</a> &mdash; enforcement log entries<br>
+    <a href="/api/retries">/api/retries</a> &mdash; retries.json state<br>
+    <code>/api/chats/:agent</code> &mdash; filter by agent name
+  </div>
+
+  <div id="messages"></div>
+
+  <script>
+    const badge = document.getElementById("statusBadge");
+    const container = document.getElementById("messages");
+    let ws;
+
+    function connect() {
+      ws = new WebSocket("ws://localhost:${PORT}");
+      ws.onopen = () => {
+        badge.textContent = "Connected";
+        badge.className = "status connected";
+      };
+      ws.onclose = () => {
+        badge.textContent = "Disconnected";
+        badge.className = "status disconnected";
+        setTimeout(connect, 3000);
+      };
+      ws.onerror = () => ws.close();
+      ws.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+          if (data.type === "chat_update" && data.messages) {
+            for (const m of data.messages) { addMessage(m); }
+          } else if (data.type === "enforcement") {
+            addEnforcement(data);
+          } else if (data.type === "ping") {
+            // heartbeat
+          }
+        } catch { /* ignore non-json */ }
+      };
+    }
+
+    function addMessage(m) {
+      const div = document.createElement("div");
+      div.className = "msg";
+      div.innerHTML =
+        '<span class="agent">' + esc(m.agent) + '</span>' +
+        '<span class="time">' + esc(m.timestamp) + '</span>' +
+        '<div class="body">' + esc(m.body.substring(0, 500)) + '</div>';
+      container.prepend(div);
+      trimChildren(container, 200);
+    }
+
+    function addEnforcement(e) {
+      const div = document.createElement("div");
+      div.className = "msg enforcement";
+      div.innerHTML =
+        '<span class="agent">ENFORCEMENT</span>' +
+        '<span class="time">' + esc(e.ts || "") + '</span>' +
+        '<div class="body">' + esc(e.decision + " | " + e.reason_code + " | agent:" + e.agentId) + '</div>';
+      container.prepend(div);
+      trimChildren(container, 200);
+    }
+
+    function esc(s) {
+      const d = document.createElement("div");
+      d.textContent = s || "";
+      return d.innerHTML;
+    }
+
+    function trimChildren(el, max) {
+      while (el.children.length > max) el.removeChild(el.lastChild);
+    }
+
+    connect();
+  </script>
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP server + WebSocket upgrade
+// ---------------------------------------------------------------------------
+const server = http.createServer((req, res) => {
+  res._req = req;
+  const reqStart = Date.now();
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const pathname = url.pathname;
+  const clientIp = req.socket.remoteAddress || "unknown";
+
+  sloMetrics.requestCount++;
+
+  // Rate limiting
+  const rl = checkRateLimit(clientIp);
+  if (!rl.allowed) {
+    sloMetrics.errorCount++;
+    setCors(res);
+    res.writeHead(429, {
+      "Content-Type": "application/json",
+      "Retry-After": String(rl.retryAfter),
+    });
+    res.end(JSON.stringify({ error: "Too many requests", retryAfter: rl.retryAfter }));
+    return;
+  }
+
+  // Track response for SLO + observability
+  const origEnd = res.end.bind(res);
+  res.end = function (...args) {
+    const dur = Date.now() - reqStart;
+    recordLatency(dur);
+    recordEndpointMetric(pathname, dur, res.statusCode);
+    if (res.statusCode >= 400) sloMetrics.errorCount++;
+    return origEnd(...args);
+  };
+
+  // CORS preflight
+  if (req.method === "OPTIONS") {
+    setCors(res);
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // RBAC middleware for critical endpoints
+  const authz = authorizeRequest(req, pathname);
+  if (isCriticalEndpoint(pathname)) {
+    const endpointLabel = `${req.method} ${pathname}`;
+    auditRbac({ role: authz.role, actor: authz.actor, decision: authz.allowed ? "allow" : "deny", endpoint: endpointLabel });
+    if (!authz.allowed) {
+      jsonResponse(res, { error: "forbidden", reason: authz.reason, required: "x-role: admin|operator|viewer" }, 403);
+      return;
+    }
+  }
+
+  // Static file serving for widget assets
+  const STATIC_DIR = path.join(HOME, ".openclaw/agent-chats");
+  const MIME_TYPES = {
+    ".html": "text/html",
+    ".js": "application/javascript",
+    ".css": "text/css",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+  };
+
+  // Dashboard demo
+  if (pathname === "/dashboard" && req.method === "GET") {
+    try {
+      const html = fs.readFileSync(path.join(STATIC_DIR, "dashboard-demo.html"), "utf-8");
+      setCors(res);
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(html);
+      return;
+    } catch {
+      // fall through to 404
+    }
+  }
+
+  // Serve widget JS and other static files
+  if (pathname.startsWith("/widget/") && req.method === "GET") {
+    const filename = path.basename(pathname);
+    // Prevent directory traversal
+    if (filename.includes("..") || filename.includes("/")) {
+      setCors(res);
+      res.writeHead(403);
+      res.end("Forbidden");
+      return;
+    }
+    const ext = path.extname(filename);
+    const mime = MIME_TYPES[ext];
+    if (mime) {
+      try {
+        const content = fs.readFileSync(path.join(STATIC_DIR, filename), "utf-8");
+        setCors(res);
+        res.writeHead(200, { "Content-Type": `${mime}; charset=utf-8` });
+        res.end(content);
+        return;
+      } catch {
+        // fall through to 404
+      }
+    }
+  }
+
+  // REST routes — test page (root)
+  if (pathname === "/" && req.method === "GET") {
+    setCors(res);
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(testPageHtml());
+    return;
+  }
+
+  if (pathname === "/api/chats" && req.method === "GET") {
+    jsonResponse(res, readChatLogs(null));
+    return;
+  }
+
+  if (pathname.startsWith("/api/chats/") && req.method === "GET") {
+    const agent = pathname.slice("/api/chats/".length).replace(/\//g, "");
+    if (!agent) {
+      jsonResponse(res, { error: "Agent name required" }, 400);
+      return;
+    }
+    jsonResponse(res, readChatLogs(agent));
+    return;
+  }
+
+  if (pathname === "/api/enforcement" && req.method === "GET") {
+    jsonResponse(res, readEnforcementLog());
+    return;
+  }
+
+  if (pathname === "/api/retries" && req.method === "GET") {
+    jsonResponse(res, readRetries());
+    return;
+  }
+
+  // Conversations history by agent (aliased for UX spec compat)
+  if (pathname.startsWith("/api/conversations/") && pathname.endsWith("/history") && req.method === "GET") {
+    const parts = pathname.split("/");
+    const agentId = parts[3]; // /api/conversations/:agentId/history
+    const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+    const chats = readChatLogs(agentId);
+    const allMessages = chats.flatMap((c) => c.messages).slice(-limit);
+    jsonResponse(res, { agentId, messages: allMessages, total: allMessages.length });
+    return;
+  }
+
+  // POST /api/messages — send message to agent (intervention from widget)
+  if (pathname === "/api/messages" && req.method === "POST") {
+    readBody(req)
+      .then((body) => {
+        const { agentId, content } = body;
+        if (!agentId || !content) {
+          jsonResponse(res, { error: "agentId and content required" }, 400);
+          return;
+        }
+        if (content.length > 10000) {
+          jsonResponse(res, { error: "Message too long (max 10000 chars)" }, 400);
+          return;
+        }
+        const result = sendAgentMessage(agentId, content);
+        if (result.success) {
+          // Broadcast the sent message to WS clients
+          broadcast({
+            type: "chat_update",
+            messages: [{
+              id: `user-${Date.now()}`,
+              timestamp: new Date().toISOString(),
+              agent: "ben",
+              body: content,
+              chat: `intervention-${agentId}`,
+            }],
+          });
+          jsonResponse(res, { success: true, agentId, sent: true });
+        } else {
+          jsonResponse(res, { success: false, error: result.error }, 502);
+        }
+      })
+      .catch((err) => {
+        jsonResponse(res, { error: err.message }, 400);
+      });
+    return;
+  }
+
+  // GET /api/metrics — aggregated metrics
+  if (pathname === "/api/metrics" && req.method === "GET") {
+    jsonResponse(res, computeMetrics());
+    return;
+  }
+
+  // GET /api/status — system health status (cached 30s)
+  if (pathname === "/api/status" && req.method === "GET") {
+    jsonResponse(res, getCachedStatus());
+    return;
+  }
+
+  // GET /api/slos — SLO metrics and alerts
+  if (pathname === "/api/slos" && req.method === "GET") {
+    jsonResponse(res, computeSLOs());
+    return;
+  }
+
+  // POST /api/slos/reset — reset SLO counters
+  if (pathname === "/api/slos/reset" && req.method === "POST") {
+    sloMetrics.requestCount = 0;
+    sloMetrics.errorCount = 0;
+    sloMetrics.latencies = [];
+    sloMetrics.startedAt = Date.now();
+    jsonResponse(res, { success: true, message: "SLO counters reset" });
+    return;
+  }
+
+  // GET /api/system — host resource metrics (CPU, RAM, Disk, Load, Net, processes)
+  if (pathname === "/api/system" && req.method === "GET") {
+    const { execSync } = require("node:child_process");
+    const os = require("node:os");
+    try {
+      const cpus = os.cpus();
+      const cpuCount = cpus.length;
+      const loadAvg = os.loadavg();
+      const totalMem = os.totalmem();
+      const freeMem = os.freemem();
+      const usedMem = totalMem - freeMem;
+      const memPct = (usedMem / totalMem * 100).toFixed(1);
+
+      // Disk usage
+      let disk = { total: 0, used: 0, free: 0, pct: 0, mount: "/" };
+      try {
+        const dfOut = execSync("df -B1 / | tail -1", { encoding: "utf-8", timeout: 5000 }).trim().split(/\s+/);
+        disk = { total: parseInt(dfOut[1]) || 0, used: parseInt(dfOut[2]) || 0, free: parseInt(dfOut[3]) || 0, pct: parseFloat(dfOut[4]) || 0, mount: dfOut[5] || "/" };
+      } catch {}
+
+      // Network (basic: bytes rx/tx from /proc/net/dev)
+      let net = { rxBytes: 0, txBytes: 0, iface: "—" };
+      try {
+        const netOut = execSync("cat /proc/net/dev | grep -E 'wl|eth|en' | head -1", { encoding: "utf-8", timeout: 3000 }).trim();
+        if (netOut) {
+          const parts = netOut.split(/\s+/);
+          net = { iface: parts[0].replace(":", ""), rxBytes: parseInt(parts[1]) || 0, txBytes: parseInt(parts[9]) || 0 };
+        }
+      } catch {}
+
+      // Key processes
+      const procs = [];
+      const procNames = [
+        { name: "gateway", match: "openclaw.*gateway" },
+        { name: "agent-chat-server", match: "agent-chat-server" },
+        { name: "ollama", match: "ollama" },
+      ];
+      for (const p of procNames) {
+        try {
+          const out = execSync(`ps aux | grep -E '${p.match}' | grep -v grep | head -1`, { encoding: "utf-8", timeout: 3000 }).trim();
+          if (out) {
+            const cols = out.split(/\s+/);
+            procs.push({ name: p.name, pid: parseInt(cols[1]) || 0, cpu: parseFloat(cols[2]) || 0, mem: parseFloat(cols[3]) || 0, rss: parseInt(cols[5]) || 0, status: "running" });
+          } else {
+            procs.push({ name: p.name, pid: 0, cpu: 0, mem: 0, rss: 0, status: "stopped" });
+          }
+        } catch {
+          procs.push({ name: p.name, pid: 0, cpu: 0, mem: 0, rss: 0, status: "unknown" });
+        }
+      }
+
+      // CPU usage (aggregate from /proc/stat snapshot)
+      let cpuPct = 0;
+      try {
+        const statOut = execSync("head -1 /proc/stat", { encoding: "utf-8", timeout: 2000 }).trim();
+        const vals = statOut.split(/\s+/).slice(1).map(Number);
+        const idle = vals[3] + (vals[4] || 0);
+        const total = vals.reduce((s, v) => s + v, 0);
+        // Store for delta calc; for now use load-based estimate
+        cpuPct = Math.min(100, (loadAvg[0] / cpuCount * 100)).toFixed(1);
+      } catch {
+        cpuPct = (loadAvg[0] / cpuCount * 100).toFixed(1);
+      }
+
+      // Uptime
+      let uptimeSeconds = os.uptime();
+
+      jsonResponse(res, {
+        timestamp: new Date().toISOString(),
+        cpu: { count: cpuCount, model: cpus[0]?.model || "—", usagePct: parseFloat(cpuPct), loadAvg: { "1m": loadAvg[0].toFixed(2), "5m": loadAvg[1].toFixed(2), "15m": loadAvg[2].toFixed(2) } },
+        memory: { totalBytes: totalMem, usedBytes: usedMem, freeBytes: freeMem, usedPct: parseFloat(memPct) },
+        disk: disk,
+        network: net,
+        processes: procs,
+        uptime: { seconds: uptimeSeconds, human: `${Math.floor(uptimeSeconds/86400)}d ${Math.floor((uptimeSeconds%86400)/3600)}h ${Math.floor((uptimeSeconds%3600)/60)}m` },
+      });
+    } catch (err) {
+      jsonResponse(res, { error: err.message }, 500);
+    }
+    return;
+  }
+
+  // GET /api/observability — panel self-monitoring metrics
+  if (pathname === "/api/observability" && req.method === "GET") {
+    jsonResponse(res, getObservability());
+    return;
+  }
+
+  // POST /api/observability/report — frontend reports JS errors and render times
+  if (pathname === "/api/observability/report" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(body);
+        if (data.jsError) {
+          obsMetrics.frontendErrors.push({ ...data.jsError, ts: new Date().toISOString() });
+          if (obsMetrics.frontendErrors.length > 50) obsMetrics.frontendErrors.shift();
+        }
+        if (typeof data.renderTimeMs === "number") {
+          obsMetrics.renderTimes.push(data.renderTimeMs);
+          if (obsMetrics.renderTimes.length > 100) obsMetrics.renderTimes.shift();
+        }
+        if (data.wsReconnect) obsMetrics.wsReconnects++;
+        jsonResponse(res, { ok: true });
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON" }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/sessions — list active sessions
+  if (pathname === "/api/sessions" && req.method === "GET") {
+    jsonResponse(res, getCachedSessions());
+    return;
+  }
+
+  // GET /api/agents — list agents with status
+  if (pathname === "/api/agents" && req.method === "GET") {
+    jsonResponse(res, getCachedAgents());
+    return;
+  }
+
+  // POST /api/actions/:action — operational actions (restart, kill, retry)
+  if (pathname.startsWith("/api/actions/") && req.method === "POST") {
+    const action = pathname.slice("/api/actions/".length);
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const params = body ? JSON.parse(body) : {};
+        const result = executeAction(action, params);
+        jsonResponse(res, result);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/kanban — get kanban board
+  if (pathname === "/api/kanban" && req.method === "GET") {
+    jsonResponse(res, kanbanGetBoard());
+    return;
+  }
+
+  // POST /api/kanban/tasks — create task
+  if (pathname === "/api/kanban/tasks" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const params = JSON.parse(body);
+        const task = kanbanCreateTask(params);
+        jsonResponse(res, task);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/kanban/tasks/:id/move — move task between columns
+  if (pathname.match(/^\/api\/kanban\/tasks\/[^/]+\/move$/) && req.method === "POST") {
+    const taskId = pathname.split("/")[4];
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const { column } = JSON.parse(body);
+        const task = kanbanMoveTask(taskId, column);
+        jsonResponse(res, task);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // POST /api/kanban/tasks/:id/evidence — add evidence
+  if (pathname.match(/^\/api\/kanban\/tasks\/[^/]+\/evidence$/) && req.method === "POST") {
+    const taskId = pathname.split("/")[4];
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const { evidence } = JSON.parse(body);
+        const task = kanbanAddEvidence(taskId, evidence);
+        jsonResponse(res, task);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // PATCH /api/kanban/tasks/:id — update task fields
+  if (pathname.match(/^\/api\/kanban\/tasks\/[^/]+$/) && req.method === "PATCH") {
+    const taskId = pathname.split("/")[4];
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const updates = JSON.parse(body);
+        const task = kanbanUpdateTask(taskId, updates);
+        jsonResponse(res, task);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/evolution — list evolution events
+  if (pathname === "/api/evolution" && req.method === "GET") {
+    jsonResponse(res, evolutionList());
+    return;
+  }
+
+  // POST /api/evolution/events — create evolution event
+  if (pathname === "/api/evolution/events" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const params = body ? JSON.parse(body) : {};
+        const created = evolutionCreate(params);
+        jsonResponse(res, created);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // PATCH /api/evolution/events/:id — update evolution event
+  if (pathname.match(/^\/api\/evolution\/events\/[^/]+$/) && req.method === "PATCH") {
+    const eventId = pathname.split("/")[4];
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const updates = body ? JSON.parse(body) : {};
+        const updated = evolutionUpdate(eventId, updates);
+        jsonResponse(res, updated);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/incidents — list incidents
+  if (pathname === "/api/incidents" && req.method === "GET") {
+    jsonResponse(res, incidentsList());
+    return;
+  }
+
+  // POST /api/incidents — create incident
+  if (pathname === "/api/incidents" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const params = body ? JSON.parse(body) : {};
+        const created = incidentsCreate(params);
+        jsonResponse(res, created);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // PATCH /api/incidents/:id — update incident
+  if (pathname.match(/^\/api\/incidents\/[^/]+$/) && req.method === "PATCH") {
+    const incidentId = pathname.split("/")[3];
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const updates = body ? JSON.parse(body) : {};
+        const updated = incidentsUpdate(incidentId, updates);
+        jsonResponse(res, updated);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // ====== GROWTH ENGINE ENDPOINTS ======
+
+  // GET /api/growth/calendar — editorial calendar
+  if (pathname === "/api/growth/calendar" && req.method === "GET") {
+    jsonResponse(res, loadJsonStore(GROWTH_CALENDAR_FILE, { items: [] }));
+    return;
+  }
+
+  // POST /api/growth/calendar/items — add calendar item
+  if (pathname === "/api/growth/calendar/items" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const params = JSON.parse(body);
+        const cal = loadJsonStore(GROWTH_CALENDAR_FILE, { items: [] });
+        const item = {
+          id: "gc-" + Date.now(),
+          platform: params.platform || "instagram", // instagram, youtube, facebook
+          type: params.type || "post", // post, reel, story, short, video
+          title: params.title || "",
+          copy: params.copy || "",
+          hashtags: params.hashtags || [],
+          scheduledAt: params.scheduledAt || null,
+          status: "draft", // draft, pending_approval, approved, scheduled, published, failed
+          owner: params.owner || null,
+          asset: params.asset || null,
+          metrics: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        cal.items.push(item);
+        saveJsonStore(GROWTH_CALENDAR_FILE, cal);
+        jsonResponse(res, item);
+      } catch (err) {
+        res.writeHead(400); res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // PATCH /api/growth/calendar/items/:id — update calendar item (approve, schedule, publish, fail)
+  if (pathname.match(/^\/api\/growth\/calendar\/items\/[^/]+$/) && req.method === "PATCH") {
+    const itemId = pathname.split("/")[5];
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const updates = JSON.parse(body);
+        const cal = loadJsonStore(GROWTH_CALENDAR_FILE, { items: [] });
+        const item = cal.items.find(i => i.id === itemId);
+        if (!item) { res.writeHead(404); res.end(JSON.stringify({ error: "not found" })); return; }
+        Object.assign(item, updates, { updatedAt: new Date().toISOString() });
+        saveJsonStore(GROWTH_CALENDAR_FILE, cal);
+        jsonResponse(res, item);
+      } catch (err) {
+        res.writeHead(400); res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/growth/metrics — consolidated growth metrics (IG/YT/Ads)
+  if (pathname === "/api/growth/metrics" && req.method === "GET") {
+    const metrics = loadJsonStore(GROWTH_METRICS_FILE, {
+      instagram: { followers: 0, engagementRate: 0, reach: 0, storiesViews: 0, posts: 0, updatedAt: null },
+      youtube: { subscribers: 0, views: 0, watchTimeHours: 0, ctr: 0, shorts: 0, updatedAt: null },
+      ads: { spend: 0, roas: 0, cpc: 0, ctr: 0, conversions: 0, updatedAt: null },
+    });
+    jsonResponse(res, metrics);
+    return;
+  }
+
+  // POST /api/growth/metrics — update growth metrics (from analyzers)
+  if (pathname === "/api/growth/metrics" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(body);
+        const metrics = loadJsonStore(GROWTH_METRICS_FILE, {
+          instagram: {}, youtube: {}, ads: {},
+        });
+        if (data.instagram) Object.assign(metrics.instagram, data.instagram, { updatedAt: new Date().toISOString() });
+        if (data.youtube) Object.assign(metrics.youtube, data.youtube, { updatedAt: new Date().toISOString() });
+        if (data.ads) Object.assign(metrics.ads, data.ads, { updatedAt: new Date().toISOString() });
+        saveJsonStore(GROWTH_METRICS_FILE, metrics);
+        jsonResponse(res, metrics);
+      } catch (err) {
+        res.writeHead(400); res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/growth/benchmark — competitive benchmark data
+  if (pathname === "/api/growth/benchmark" && req.method === "GET") {
+    jsonResponse(res, loadJsonStore(GROWTH_BENCHMARK_FILE, { references: [], updatedAt: null }));
+    return;
+  }
+
+  // POST /api/growth/benchmark — update benchmark data
+  if (pathname === "/api/growth/benchmark" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(body);
+        saveJsonStore(GROWTH_BENCHMARK_FILE, { ...data, updatedAt: new Date().toISOString() });
+        jsonResponse(res, { ok: true });
+      } catch (err) {
+        res.writeHead(400); res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // GET /api/retention — retention policy and stats
+  if (pathname === "/api/retention" && req.method === "GET") {
+    jsonResponse(res, getRetentionStats());
+    return;
+  }
+
+  // POST /api/retention/archive — force archive old data
+  if (pathname === "/api/retention/archive" && req.method === "POST") {
+    const result = runRetentionArchive();
+    jsonResponse(res, result);
+    return;
+  }
+
+  // GET /api/timeline — unified event timeline
+  if (pathname === "/api/timeline" && req.method === "GET") {
+    jsonResponse(res, getTimeline());
+    return;
+  }
+
+  // Health
+  if (pathname === "/health" && req.method === "GET") {
+    jsonResponse(res, {
+      status: "ok",
+      uptime: process.uptime(),
+      clients: wsClients.size,
+      port: PORT,
+    });
+    return;
+  }
+
+  // ====== PostgreSQL-backed API routes (CRM, Financial, RAG, Core) ======
+  const pgMatch = pgRouter.match(req.method, pathname);
+  if (pgMatch) {
+    (async () => {
+      try {
+        req.params = pgMatch.params;
+        req.query = parseQuery(req.url);
+        const body = await readJsonBody(req);
+        // Set tenant context for RLS before executing handler
+        const tenantHdr = req.headers["x-tenant-id"];
+        if (tenantHdr) dbMod.setActiveTenant(tenantHdr);
+        const result = await pgMatch.handler(req, body);
+        jsonResponse(res, result);
+      } catch (err) {
+        const status = err.status || 500;
+        const message = err.message || "Internal server error";
+        jsonResponse(res, { error: message }, status);
+      } finally {
+        dbMod.setActiveTenant(null);
+      }
+    })();
+    return;
+  }
+
+  // 404
+  setCors(res);
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Not found" }));
+});
+
+// WebSocket upgrade
+server.on("upgrade", (req, socket, head) => {
+  const key = req.headers["sec-websocket-key"];
+  if (!key) {
+    socket.destroy();
+    return;
+  }
+
+  const acceptKey = computeAcceptKey(key);
+  const headers = [
+    "HTTP/1.1 101 Switching Protocols",
+    "Upgrade: websocket",
+    "Connection: Upgrade",
+    `Sec-WebSocket-Accept: ${acceptKey}`,
+    "",
+    "",
+  ].join("\r\n");
+
+  socket.write(headers);
+  wsClients.add(socket);
+  sloMetrics.wsConnections++;
+
+  log(`WS client connected (total: ${wsClients.size})`);
+
+  // Send initial state
+  const initial = {
+    type: "init",
+    chats: readChatLogs(null),
+    enforcement: readEnforcementLog().slice(-20),
+    retries: readRetries(),
+  };
+  try {
+    socket.write(encodeFrame(JSON.stringify(initial)));
+  } catch {
+    // ignore
+  }
+
+  // Handle incoming frames
+  let buffer = Buffer.alloc(0);
+  socket.on("data", (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (buffer.length > 0) {
+      const frame = decodeFrame(buffer);
+      if (!frame) break;
+      buffer = buffer.slice(frame.totalLength);
+
+      // Close frame
+      if (frame.opcode === 0x08) {
+        const closeFrame = Buffer.alloc(2);
+        closeFrame[0] = 0x88;
+        closeFrame[1] = 0;
+        try {
+          socket.write(closeFrame);
+        } catch {
+          // ignore
+        }
+        socket.end();
+        return;
+      }
+
+      // Pong (response to our ping) — nothing to do
+      if (frame.opcode === 0x0a) continue;
+
+      // Ping from client — send pong
+      if (frame.opcode === 0x09) {
+        const pong = Buffer.alloc(2 + frame.payload.length);
+        pong[0] = 0x8a; // FIN + pong
+        pong[1] = frame.payload.length;
+        frame.payload.copy(pong, 2);
+        try {
+          socket.write(pong);
+        } catch {
+          // ignore
+        }
+        continue;
+      }
+    }
+  });
+
+  socket.on("close", () => {
+    wsClients.delete(socket);
+    sloMetrics.wsDisconnections++;
+    log(`WS client disconnected (total: ${wsClients.size})`);
+  });
+
+  socket.on("error", () => {
+    wsClients.delete(socket);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// File watchers — broadcast changes in real-time
+// ---------------------------------------------------------------------------
+const watchedFiles = new Map(); // filename -> last mtime
+
+function startWatchers() {
+  // Ensure logs dir exists
+  try {
+    fs.mkdirSync(LOGS_DIR, { recursive: true });
+  } catch {
+    // ignore
+  }
+
+  // Watch chat logs directory
+  try {
+    fs.watch(LOGS_DIR, { persistent: true }, (eventType, filename) => {
+      if (!filename || !filename.endsWith(".md")) return;
+
+      const filepath = path.join(LOGS_DIR, filename);
+      try {
+        const stat = fs.statSync(filepath);
+        const lastMtime = watchedFiles.get(filename);
+
+        if (lastMtime && stat.mtimeMs <= lastMtime) return;
+        watchedFiles.set(filename, stat.mtimeMs);
+
+        const content = fs.readFileSync(filepath, "utf-8");
+        const parsed = parseChatLog(content, filename);
+
+        broadcast({
+          type: "chat_update",
+          chat: parsed.chat,
+          agents: parsed.agents,
+          date: parsed.date,
+          messages: parsed.messages,
+          updatedAt: new Date().toISOString(),
+        });
+
+        log(`Chat updated: ${filename} (${parsed.messages.length} msgs)`);
+      } catch {
+        // file may have been deleted
+      }
+    });
+    log(`Watching chat logs: ${LOGS_DIR}`);
+  } catch (err) {
+    log(`Warning: could not watch ${LOGS_DIR}: ${err.message}`);
+  }
+
+  // Watch enforcement log
+  try {
+    const enforcementDir = path.dirname(ENFORCEMENT_LOG);
+    fs.mkdirSync(enforcementDir, { recursive: true });
+
+    let lastEnforcementSize = 0;
+    try {
+      lastEnforcementSize = fs.statSync(ENFORCEMENT_LOG).size;
+    } catch {
+      // file may not exist yet
+    }
+
+    fs.watch(enforcementDir, { persistent: true }, (eventType, filename) => {
+      if (filename !== path.basename(ENFORCEMENT_LOG)) return;
+
+      try {
+        const stat = fs.statSync(ENFORCEMENT_LOG);
+        if (stat.size <= lastEnforcementSize) {
+          lastEnforcementSize = stat.size;
+          return;
+        }
+
+        // Read only the new bytes
+        const fd = fs.openSync(ENFORCEMENT_LOG, "r");
+        const newBytes = Buffer.alloc(stat.size - lastEnforcementSize);
+        fs.readSync(fd, newBytes, 0, newBytes.length, lastEnforcementSize);
+        fs.closeSync(fd);
+        lastEnforcementSize = stat.size;
+
+        const newLines = newBytes.toString("utf-8").trim().split("\n");
+        for (const line of newLines) {
+          try {
+            const entry = JSON.parse(line);
+            broadcast({ type: "enforcement", ...entry });
+          } catch {
+            // skip malformed lines
+          }
+        }
+
+        log(`Enforcement log: ${newLines.length} new entries`);
+      } catch {
+        // ignore
+      }
+    });
+    log(`Watching enforcement log: ${ENFORCEMENT_LOG}`);
+  } catch (err) {
+    log(`Warning: could not watch enforcement log: ${err.message}`);
+  }
+
+  // Watch retries.json
+  try {
+    const retriesDir = path.dirname(RETRIES_JSON);
+    fs.watch(retriesDir, { persistent: true }, (eventType, filename) => {
+      if (filename !== path.basename(RETRIES_JSON)) return;
+
+      try {
+        const data = readRetries();
+        broadcast({ type: "retries_update", ...data });
+        log("Retries state updated");
+      } catch {
+        // ignore
+      }
+    });
+    log(`Watching retries: ${RETRIES_JSON}`);
+  } catch (err) {
+    log(`Warning: could not watch retries: ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat — keep WS connections alive
+// ---------------------------------------------------------------------------
+setInterval(() => {
+  for (const client of wsClients) {
+    sendPing(client);
+  }
+}, 30000);
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+function log(msg) {
+  const ts = new Date().toISOString();
+  process.stdout.write(`[${ts}] ${msg}\n`);
+}
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+server.listen(PORT, "127.0.0.1", () => {
+  log(`Agent Chat Bridge running on http://127.0.0.1:${PORT}`);
+  log(`WebSocket endpoint: ws://127.0.0.1:${PORT}`);
+  log(`REST: /api/chats, /api/chats/:agent, /api/enforcement, /api/retries`);
+  log(`Test page: http://127.0.0.1:${PORT}/`);
+  startWatchers();
+});
+
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  log("SIGTERM received, shutting down...");
+  for (const client of wsClients) {
+    try {
+      const closeFrame = Buffer.alloc(2);
+      closeFrame[0] = 0x88;
+      closeFrame[1] = 0;
+      client.write(closeFrame);
+      client.end();
+    } catch {
+      // ignore
+    }
+  }
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000);
+});
+
+process.on("SIGINT", () => {
+  log("SIGINT received, shutting down...");
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 2000);
+});

@@ -1,0 +1,22 @@
+{
+  "name": "agent-chats",
+  "version": "1.0.0",
+  "description": "",
+  "main": "agent-chat-widget.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "csv-parse": "^6.1.0",
+    "mammoth": "^1.12.0",
+    "multer": "^2.1.1",
+    "pdf-parse": "^2.4.5",
+    "pg": "^8.20.0",
+    "playwright": "^1.58.2",
+    "xlsx": "^0.18.5"
+  }
+}

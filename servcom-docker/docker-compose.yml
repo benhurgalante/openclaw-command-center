@@ -1,0 +1,20 @@
+services:
+  iris:
+    image: intersystemsdc/iris-community:2024.3
+    container_name: servcom-iris
+    restart: unless-stopped
+    ports:
+      - "1972:1972"       # SuperServer
+      - "52773:52773"     # Web Portal / CSP
+    volumes:
+      - iris-data:/dur/irisys
+      - ./import:/opt/import
+      - ./iris-config/iris.script:/opt/iris.script
+      - ./iris-config/init.sh:/opt/init.sh
+    environment:
+      - ISC_DATA_DIRECTORY=/dur/irisys
+    command: >
+      --check-caps false
+
+volumes:
+  iris-data:

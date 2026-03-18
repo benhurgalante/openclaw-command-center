@@ -1,0 +1,53 @@
+; Script de configuração inicial do IRIS para ServCom
+; Executar via: iris session IRIS < /opt/iris.script
+
+; Criar namespaces RTD e RPJ
+zn "%SYS"
+
+; Criar database RTD
+Set Properties("Directory") = "/dur/irisys/mgr/rtd/"
+Do ##class(SYS.Database).CreateDatabase("/dur/irisys/mgr/rtd/", 1024)
+Do ##class(Config.Databases).Create("RTD", .Properties)
+
+; Criar namespace RTD
+Kill Properties
+Set Properties("Globals") = "RTD"
+Set Properties("Routines") = "RTD"
+Do ##class(Config.Namespaces).Create("RTD", .Properties)
+
+; Criar database RPJ
+Set Properties("Directory") = "/dur/irisys/mgr/rpj/"
+Do ##class(SYS.Database).CreateDatabase("/dur/irisys/mgr/rpj/", 512)
+Kill Properties
+Set Properties("Globals") = "RPJ"
+Set Properties("Routines") = "RPJ"
+Do ##class(Config.Databases).Create("RPJ", .Properties)
+Do ##class(Config.Namespaces).Create("RPJ", .Properties)
+
+; Habilitar CSP para RTD e RPJ
+Kill Properties
+Set Properties("NameSpace") = "RTD"
+Set Properties("Path") = "/opt/csp/rtd/"
+Set Properties("AutheEnabled") = 64
+Set Properties("IsNameSpaceDefault") = 1
+Set Properties("AutoCompile") = 1
+Do ##class(Security.Applications).Create("/csp/rtd", .Properties)
+
+Kill Properties
+Set Properties("NameSpace") = "RPJ"
+Set Properties("Path") = "/opt/csp/rpj/"
+Set Properties("AutheEnabled") = 64
+Set Properties("IsNameSpaceDefault") = 1
+Set Properties("AutoCompile") = 1
+Do ##class(Security.Applications).Create("/csp/rpj", .Properties)
+
+; Habilitar REST API
+Kill Properties
+Set Properties("NameSpace") = "RTD"
+Set Properties("AutheEnabled") = 64
+Set Properties("DispatchClass") = "ServCom.REST.Router"
+Do ##class(Security.Applications).Create("/api/servcom", .Properties)
+
+Write "ServCom namespaces e CSP configurados!",!
+
+Halt
