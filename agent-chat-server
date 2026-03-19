@@ -52,7 +52,9 @@ const GROWTH_DIR = path.join(HOME, ".openclaw/workspace-ads/.growth");
 const GROWTH_CALENDAR_FILE = path.join(GROWTH_DIR, "calendar.json");
 const GROWTH_METRICS_FILE = path.join(GROWTH_DIR, "metrics.json");
 const GROWTH_BENCHMARK_FILE = path.join(GROWTH_DIR, "benchmark.json");
+const OBS_SNAPSHOT_FILE = path.join(HOME, ".openclaw/logs/obs-metrics-snapshot.json");
 try { fs.mkdirSync(GROWTH_DIR, { recursive: true }); } catch {}
+try { fs.mkdirSync(path.join(HOME, ".openclaw/logs"), { recursive: true }); } catch {}
 
 // ---------------------------------------------------------------------------
 // Chat log parser — converts markdown logs to structured JSON
@@ -1105,6 +1107,11 @@ function authorizeRequest(req, pathname) {
     return { allowed: false, role, actor, reason: "viewer_read_only" };
   }
 
+  // Operators cannot approve/move Kanban tasks to 'aprovado' or 'concluido' — admin only
+  if (role === "operator" && pathname.includes("/kanban/tasks/") && pathname.endsWith("/move")) {
+    return { allowed: true, role, actor, reason: "ok_operator_move_checked_by_handler" };
+  }
+
   return { allowed: true, role, actor, reason: "ok" };
 }
 
@@ -1715,6 +1722,12 @@ const server = http.createServer((req, res) => {
     req.on("end", () => {
       try {
         const { column } = JSON.parse(body);
+        // P1: Operators cannot approve or conclude tasks — admin only
+        const role = normalizeRole(req.headers["x-role"] || req.headers["x-user-role"]);
+        if ((column === "aprovado" || column === "concluido") && role !== "admin") {
+          jsonResponse(res, { error: "Only admin can approve or conclude tasks", role }, 403);
+          return;
+        }
         const task = kanbanMoveTask(taskId, column);
         jsonResponse(res, task);
       } catch (err) {
@@ -2040,6 +2053,7 @@ server.on("upgrade", (req, socket, head) => {
 
   socket.write(headers);
   wsClients.add(socket);
+  wsClientMeta.set(socket, { lastPong: Date.now(), missedPings: 0 });
   sloMetrics.wsConnections++;
 
   log(`WS client connected (total: ${wsClients.size})`);
@@ -2080,8 +2094,14 @@ server.on("upgrade", (req, socket, head) => {
         return;
       }
 
-      // Pong (response to our ping) — nothing to do
-      if (frame.opcode === 0x0a) continue;
+      // Pong (response to our ping) — track last pong time
+      if (frame.opcode === 0x0a) {
+        const meta = wsClientMeta.get(socket) || { lastPong: Date.now(), missedPings: 0 };
+        meta.lastPong = Date.now();
+        meta.missedPings = 0;
+        wsClientMeta.set(socket, meta);
+        continue;
+      }
 
       // Ping from client — send pong
       if (frame.opcode === 0x09) {
@@ -2228,13 +2248,58 @@ function startWatchers() {
 }
 
 // ---------------------------------------------------------------------------
-// Heartbeat — keep WS connections alive
+// Heartbeat — keep WS connections alive (P1: per-client timeout tracking)
 // ---------------------------------------------------------------------------
+const WS_PING_INTERVAL = 30000;
+const WS_PONG_TIMEOUT = 10000;
+const wsClientMeta = new WeakMap(); // socket -> { lastPong, missedPings }
+
 setInterval(() => {
+  const now = Date.now();
   for (const client of wsClients) {
+    const meta = wsClientMeta.get(client) || { lastPong: now, missedPings: 0 };
+    // If no pong received since last ping, increment missed count
+    if (now - meta.lastPong > WS_PING_INTERVAL + WS_PONG_TIMEOUT) {
+      meta.missedPings++;
+      if (meta.missedPings >= 3) {
+        log(`WS zombie client detected (${meta.missedPings} missed pings), closing`);
+        try { client.end(); } catch {}
+        wsClients.delete(client);
+        continue;
+      }
+    }
+    wsClientMeta.set(client, meta);
     sendPing(client);
   }
-}, 30000);
+}, WS_PING_INTERVAL);
+
+// ---------------------------------------------------------------------------
+// Observability persistence — flush snapshot every 5 minutes
+// ---------------------------------------------------------------------------
+setInterval(() => {
+  try {
+    const snapshot = {
+      ts: new Date().toISOString(),
+      slo: {
+        requestCount: sloMetrics.requestCount,
+        errorCount: sloMetrics.errorCount,
+        wsConnections: sloMetrics.wsConnections,
+        wsDisconnections: sloMetrics.wsDisconnections,
+        uptimeS: Math.round((Date.now() - sloMetrics.startedAt) / 1000),
+      },
+      obs: getObservability(),
+    };
+    // Append to ring buffer file (keep last 288 entries = 24h at 5min intervals)
+    let history = [];
+    try { history = JSON.parse(fs.readFileSync(OBS_SNAPSHOT_FILE, "utf-8")); } catch {}
+    if (!Array.isArray(history)) history = [];
+    history.push(snapshot);
+    if (history.length > 288) history = history.slice(-288);
+    fs.writeFileSync(OBS_SNAPSHOT_FILE, JSON.stringify(history, null, 2));
+  } catch (err) {
+    // Silently ignore persistence errors — obs is best-effort
+  }
+}, 300000); // 5 minutes
 
 // ---------------------------------------------------------------------------
 // Logging
