@@ -1636,6 +1636,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // GET /api/observability/history — historical metrics from ring buffer (P2)
+  if (pathname === "/api/observability/history" && req.method === "GET") {
+    try {
+      const url = new URL(req.url, "http://localhost");
+      const last = parseInt(url.searchParams.get("last") || "288", 10);
+      let history = [];
+      try { history = JSON.parse(fs.readFileSync(OBS_SNAPSHOT_FILE, "utf-8")); } catch {}
+      if (!Array.isArray(history)) history = [];
+      jsonResponse(res, { entries: history.slice(-last), total: history.length });
+    } catch {
+      jsonResponse(res, { entries: [], total: 0 });
+    }
+    return;
+  }
+
   // POST /api/observability/report — frontend reports JS errors and render times
   if (pathname === "/api/observability/report" && req.method === "POST") {
     let body = "";
