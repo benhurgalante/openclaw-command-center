@@ -228,14 +228,19 @@ function getSystemStatus() {
       env: { ...process.env, HOME, PATH: `${HOME}/.npm-global/bin:${HOME}/.local/bin:${process.env.PATH || "/usr/bin"}` },
     });
     const data = JSON.parse(raw);
+    // Gateway may report reachable=false due to missing auth scope even when running
+    const gwError = data.gateway?.error || "";
+    const gwConnected = typeof data.gateway?.connectLatencyMs === "number" && data.gateway.connectLatencyMs < 5000;
+    const gwReachable = data.gateway?.reachable || (gwConnected && gwError.includes("missing scope"));
     return {
       gateway: {
         mode: data.gateway?.mode || "unknown",
-        reachable: data.gateway?.reachable || false,
+        reachable: gwReachable,
         latencyMs: data.gateway?.connectLatencyMs || null,
         version: data.gateway?.self?.version || "unknown",
         host: data.gateway?.self?.host || "unknown",
         platform: data.gateway?.self?.platform || "unknown",
+        scopeWarning: gwError.includes("missing scope") ? gwError : null,
       },
       update: {
         current: data.gateway?.self?.version || "unknown",
