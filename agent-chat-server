@@ -447,16 +447,16 @@ function getTimeline() {
     }
   } catch {}
 
-  // Chat messages (last 20)
+  // Chat messages (last 20 actual messages from all chats)
   const chats = readChatLogs(null);
-  const recentMsgs = chats.slice(-20);
-  for (const msg of recentMsgs) {
+  const allMessages = chats.flatMap((c) => (c.messages || []).map((m) => ({ ...m, chatAgent: c.agent || c.from }))).slice(-20);
+  for (const msg of allMessages) {
     events.push({
       type: "chat",
-      timestamp: msg.timestamp || `${msg.date}T${msg.time}`,
-      agent: msg.from,
+      timestamp: msg.timestamp || msg.ts || `${msg.date || ""}T${msg.time || ""}`,
+      agent: msg.agent || msg.from || msg.chatAgent,
       to: msg.to,
-      preview: (msg.content || "").slice(0, 80),
+      preview: (msg.body || msg.content || msg.text || "").slice(0, 80),
     });
   }
 
@@ -1063,7 +1063,8 @@ function isCriticalEndpoint(pathname) {
     pathname.startsWith("/api/actions") ||
     pathname.startsWith("/api/kanban") ||
     pathname.startsWith("/api/evolution") ||
-    pathname.startsWith("/api/incidents")
+    pathname.startsWith("/api/incidents") ||
+    pathname === "/api/messages"
   );
 }
 
