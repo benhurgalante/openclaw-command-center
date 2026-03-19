@@ -1406,17 +1406,22 @@ const server = http.createServer((req, res) => {
     ".svg": "image/svg+xml",
   };
 
-  // Dashboard demo
+  // Dashboard — serve updated Command Center (plugin version with P0/P1/P2 fixes)
   if (pathname === "/dashboard" && req.method === "GET") {
-    try {
-      const html = fs.readFileSync(path.join(STATIC_DIR, "dashboard-demo.html"), "utf-8");
-      setCors(res);
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(html);
-      return;
-    } catch {
-      // fall through to 404
+    const dashPaths = [
+      path.join(HOME, ".openclaw/plugins/health-dashboard/public/index.html"),
+      path.join(STATIC_DIR, "dashboard-demo.html"),
+    ];
+    for (const dp of dashPaths) {
+      try {
+        const html = fs.readFileSync(dp, "utf-8");
+        setCors(res);
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+        res.end(html);
+        return;
+      } catch { /* try next */ }
     }
+    // fall through to 404
   }
 
   // Serve widget JS and other static files
@@ -1444,11 +1449,11 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  // REST routes — test page (root)
+  // Root redirects to Command Center dashboard
   if (pathname === "/" && req.method === "GET") {
     setCors(res);
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(testPageHtml());
+    res.writeHead(302, { "Location": "/dashboard" });
+    res.end();
     return;
   }
 
